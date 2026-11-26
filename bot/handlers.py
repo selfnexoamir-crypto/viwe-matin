@@ -12,7 +12,7 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import Config
@@ -1345,23 +1345,6 @@ async def cb_settings(cb: types.CallbackQuery, state: FSMContext):
             parse_mode="HTML",
         )
 
-    elif data == "viewguard":
-        from core.view_guard import VIEW_GUARD, MAX_VIEWS_PER_DAY, MIN_GAP_SEC, MAX_GAP_SEC
-        from bot.keyboards import viewguard_menu
-        stats = VIEW_GUARD.stats()
-        await cb.message.edit_text(
-            f"🔒 <b>تنظیمات ضد لیمیت (ViewGuard)</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"📊 ویوهای امروز (کل): <b>{stats['total_views_today']}</b>\n"
-            f"🚫 اکانت‌های flood: <b>{stats['flooded_now']}</b>\n"
-            f"💤 سهمیه تموم‌شده: <b>{stats['exhausted_today']}</b>\n\n"
-            f"⚙️ تنظیمات فعلی:\n"
-            f"  📅 سهمیه روزانه هر اکانت: <b>{MAX_VIEWS_PER_DAY}</b>\n"
-            f"  ⏳ فاصله بین ویو: <b>{MIN_GAP_SEC:.0f}-{MAX_GAP_SEC:.0f} ثانیه</b>\n\n"
-            f"👇 گزینه مورد نظر:",
-            reply_markup=viewguard_menu(),
-            parse_mode="HTML",
-        )
 
     try:
         await cb.answer()
@@ -2235,34 +2218,133 @@ async def add_phone(msg: types.Message, state: FSMContext):
         await state.clear()
         return
 
-    await msg.answer(f"📱 <code>{phone}</code>\n⏳ در حال ارسال کد...", parse_mode="HTML")
+    status_msg = await msg.answer(f"📱 <code>{phone}</code>\n⏳ در حال ارسال کد...", parse_mode="HTML")
     c = None
-    try:
-        c    = TelegramClient(StringSession(), Config.API_ID, Config.API_HASH)
-        await asyncio.wait_for(c.connect(), timeout=20)
-        sent = await asyncio.wait_for(c.send_code_request(phone), timeout=25)
+
+    def _pick_warp_proxy() -> dict | None:
+        """یه port سالم از healthy_ports.json می‌گیره و به‌صورت SOCKS5 برمی‌گردونه."""
+        try:
+            from config import Config as _Cfg
+            import json as _json, random as _rnd
+            hf = _Cfg.BASE_DIR / "proxies" / "healthy_ports.json"
+            if not hf.exists():
+                return None
+            data = _json.loads(hf.read_text())
+            port_to_ip: dict = data.get("port_to_ip", {})
+            if not port_to_ip:
+                return None
+            port_str = _rnd.choice(list(port_to_ip.keys()))
+            return {
+                "proxy_type": "socks5",
+                "addr": "127.0.0.1",
+                "port": int(port_str),
+                "rdns": True,
+            }
+        except Exception:
+            return None
+
+    async def _do_send_code() -> None:
+        nonlocal c
+        c = TelegramClient(
+            StringSession(),
+            Config.API_ID,
+            Config.API_HASH,
+            connection_retries=3,
+            retry_delay=2,
+            timeout=25,
+        )
+        # اول proxy اختصاصی این شماره رو چک کن (account_proxy.json)
+        # اگه نبود، از pool WARP یه port سالم بگیر
+        # این برای شماره‌های غیر ایرانی (+1, +44, ...) که DC فرق دارن حیاتیه
+        px = None
+        try:
+            from core.proxy_loader import get_proxy_for
+            px = get_proxy_for(phone)
+        except Exception:
+            pass
+        if not px:
+            px = _pick_warp_proxy()
+        if px:
+            c.set_proxy(px)
+        await asyncio.wait_for(c.connect(), timeout=25)
+        sent = await asyncio.wait_for(c.send_code_request(phone), timeout=30)
         _pending_clients[msg.from_user.id] = c
-        await state.update_data(phone=phone, phone_code_hash=sent.phone_code_hash)
+        await state.update_data(
+            phone=phone,
+            phone_code_hash=sent.phone_code_hash,
+            send_code_proxy=px,          # ذخیره می‌کنیم تا sign_in هم از همون proxy استفاده کنه
+        )
         await state.set_state(AddAccount.waiting_code)
-        await msg.answer("✉️ <b>کد ارسال شد</b>\n\nکد رو با اعداد انگلیسی وارد کن:", parse_mode="HTML")
-    except asyncio.TimeoutError:
-        await msg.answer("❌ <b>Timeout</b>\nسرور تلگرام پاسخ نداد.", parse_mode="HTML")
+        proxy_note = f" <i>(از WARP پورت {px['port']})</i>" if px else ""
+        await msg.answer(
+            f"✉️ <b>کد ارسال شد</b>{proxy_note}\n\nکد رو با اعداد انگلیسی وارد کن:",
+            parse_mode="HTML",
+        )
+
+    async def _cleanup_client() -> None:
         if c:
-            try: await c.disconnect()
-            except Exception: pass
-        await state.clear()
-    except Exception as e:
-        err  = str(e)
-        hint = ""
-        if "PHONE_NUMBER_INVALID" in err:  hint = "\n📌 شماره اشتباه"
-        elif "PHONE_NUMBER_BANNED" in err: hint = "\n📌 شماره بن شده"
-        elif "FLOOD" in err.upper():       hint = "\n📌 ۵ دقیقه صبر کن"
-        await msg.answer(f"❌ <b>خطا</b>: <code>{err[:150]}</code>{hint}", parse_mode="HTML")
-        if c:
-            try: await c.disconnect()
-            except Exception: pass
+            try:
+                await c.disconnect()
+            except Exception:
+                pass
         _pending_clients.pop(msg.from_user.id, None)
-        await state.clear()
+
+    # اول بدون retry امتحان کن — اگه FloodWait بود یه بار صبر کن و دوباره try کن
+    for attempt in range(2):
+        try:
+            await _do_send_code()
+            break  # موفق بود
+        except asyncio.TimeoutError:
+            await _cleanup_client()
+            await state.clear()
+            await msg.answer("❌ <b>Timeout</b>\nسرور تلگرام پاسخ نداد.", parse_mode="HTML")
+            return
+        except FloodWaitError as e:
+            wait_sec = e.seconds
+            if attempt == 0 and wait_sec <= 60:
+                # کمتر از ۶۰ ثانیه — صبر می‌کنیم و retry می‌کنیم
+                await _cleanup_client()
+                c = None
+                mins, secs = divmod(wait_sec, 60)
+                time_str = f"{mins}م {secs}ث" if mins else f"{secs}ث"
+                await status_msg.edit_text(
+                    f"⏳ <b>FloodWait</b> برای <code>{phone}</code>\n"
+                    f"تلگرام {time_str} صبر خواست — داریم صبر می‌کنیم...",
+                    parse_mode="HTML"
+                )
+                await asyncio.sleep(wait_sec + 2)
+                await status_msg.edit_text(
+                    f"📱 <code>{phone}</code>\n⏳ دوباره در حال ارسال کد...",
+                    parse_mode="HTML"
+                )
+                continue
+            else:
+                # بیشتر از ۶۰ ثانیه یا retry دوم هم flood داد
+                await _cleanup_client()
+                await state.clear()
+                mins, secs = divmod(wait_sec, 60)
+                time_str = f"{mins} دقیقه و {secs} ثانیه" if mins else f"{wait_sec} ثانیه"
+                await msg.answer(
+                    f"🚫 <b>محدودیت تلگرام (FloodWait)</b>\n\n"
+                    f"📱 شماره: <code>{phone}</code>\n"
+                    f"⏱ باید <b>{time_str}</b> صبر کنی و دوباره امتحان کنی.\n\n"
+                    f"📌 دلیل: تعداد زیاد درخواست ارسال کد از یه API_ID.",
+                    parse_mode="HTML"
+                )
+                return
+        except Exception as e:
+            await _cleanup_client()
+            await state.clear()
+            err = str(e)
+            hint = ""
+            if "PHONE_NUMBER_INVALID" in err:   hint = "\n📌 فرمت شماره اشتباهه"
+            elif "PHONE_NUMBER_BANNED" in err:  hint = "\n📌 این شماره توسط تلگرام بن شده"
+            elif "AUTH_RESTART" in err:         hint = "\n📌 session خراب شده — دوباره شروع کن"
+            await msg.answer(
+                f"❌ <b>خطا</b>: <code>{err[:200]}</code>{hint}",
+                parse_mode="HTML"
+            )
+            return
 
 
 @router.message(StateFilter(AddAccount.waiting_code))
@@ -2384,194 +2466,6 @@ async def _on_error(event: types.ErrorEvent):
     return True
 
 
-# ─────────────────────────────────────────────────────────
-# ViewGuard FSM states
-# ─────────────────────────────────────────────────────────
-from aiogram.fsm.state import State, StatesGroup
-
-class _VGState(StatesGroup):
-    waiting_daily_quota  = State()
-    waiting_gap          = State()
-    waiting_start_delay  = State()
-
-
-# ─────────────────────────────────────────────────────────
-# Callback: menu:settings (برگشت به تنظیمات)
-# ─────────────────────────────────────────────────────────
-@router.callback_query(F.data == "menu:settings")
-async def cb_back_settings(cb: types.CallbackQuery):
-    from bot.keyboards import settings_menu
-    from core.pool import POOL
-    mn = int(db.get_setting("shift_min_sec", Config.SHIFT_MIN_SEC)) // 60
-    mx = int(db.get_setting("shift_max_sec", Config.SHIFT_MAX_SEC)) // 60
-    try:
-        await cb.message.edit_text(
-            f"⚙️ <b>تنظیمات</b>\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-            f"⏱️ بازه شیفت: <b>{mn}-{mx} دقیقه</b>\n"
-            f"🔢 شیفت فعال: <b>{POOL.active_shift}</b>\n\n"
-            f"👇 گزینه مورد نظر:",
-            reply_markup=settings_menu(),
-            parse_mode="HTML",
-        )
-    except Exception:
-        pass
-    await cb.answer()
-
-
-# ─────────────────────────────────────────────────────────
-# Callback: vg:* (ViewGuard)
-# ─────────────────────────────────────────────────────────
-@router.callback_query(F.data.startswith("vg:"))
-async def cb_viewguard(cb: types.CallbackQuery, state: FSMContext):
-    from core.view_guard import VIEW_GUARD, MAX_VIEWS_PER_DAY, MIN_GAP_SEC, MAX_GAP_SEC
-    from bot.keyboards import viewguard_menu
-    action = cb.data.split(":")[1]
-
-    if action == "stats":
-        stats = VIEW_GUARD.stats()
-        pct   = int(stats["total_views_today"] / max(stats["total_accounts"] * MAX_VIEWS_PER_DAY, 1) * 100)
-        bar   = "▰" * min(pct // 10, 10) + "▱" * max(0, 10 - pct // 10)
-        await cb.answer(
-            f"📊 ویوی امروز: {stats['total_views_today']}\n"
-            f"{bar}\n"
-            f"🚫 flood: {stats['flooded_now']} | 💤 تموم: {stats['exhausted_today']}",
-            show_alert=True,
-        )
-
-    elif action == "reset":
-        # ریست state همه اکانت‌ها
-        from core.view_guard import _AccountState
-        for st in VIEW_GUARD._state.values():
-            st.views_today = 0
-            st.day_key     = ""
-        await cb.answer("✅ آمار ویو همه اکانت‌ها ریست شد", show_alert=True)
-        # آپدیت متن
-        stats = VIEW_GUARD.stats()
-        try:
-            await cb.message.edit_text(
-                f"🔒 <b>تنظیمات ضد لیمیت (ViewGuard)</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-                f"📊 ویوهای امروز (کل): <b>0</b>\n"
-                f"🚫 اکانت‌های flood: <b>{stats['flooded_now']}</b>\n"
-                f"💤 سهمیه تموم‌شده: <b>0</b>\n\n"
-                f"⚙️ تنظیمات فعلی:\n"
-                f"  📅 سهمیه روزانه هر اکانت: <b>{MAX_VIEWS_PER_DAY}</b>\n"
-                f"  ⏳ فاصله بین ویو: <b>{MIN_GAP_SEC:.0f}-{MAX_GAP_SEC:.0f} ثانیه</b>\n\n"
-                f"👇 گزینه مورد نظر:",
-                reply_markup=viewguard_menu(),
-                parse_mode="HTML",
-            )
-        except Exception:
-            pass
-
-    elif action == "set_daily":
-        await cb.message.edit_text(
-            f"📅 <b>سهمیه روزانه ویو</b>\n\n"
-            f"فعلی: <b>{MAX_VIEWS_PER_DAY}</b> ویو در روز برای هر اکانت\n\n"
-            f"عدد جدید رو بفرست (مثال: <code>80</code>):",
-            reply_markup=cancel_menu(),
-            parse_mode="HTML",
-        )
-        await state.set_state(_VGState.waiting_daily_quota)
-        await cb.answer()
-        return
-
-    elif action == "set_gap":
-        from core.view_guard import MIN_GAP_SEC, MAX_GAP_SEC
-        await cb.message.edit_text(
-            f"⏳ <b>فاصله بین ویوها</b>\n\n"
-            f"فعلی: <b>{MIN_GAP_SEC:.0f}-{MAX_GAP_SEC:.0f} ثانیه</b>\n\n"
-            f"دو عدد بفرست (ثانیه): حداقل حداکثر\n"
-            f"مثال: <code>8 25</code>",
-            reply_markup=cancel_menu(),
-            parse_mode="HTML",
-        )
-        await state.set_state(_VGState.waiting_gap)
-        await cb.answer()
-        return
-
-    elif action == "set_start_delay":
-        cur_delay = float(db.get_setting("view_start_delay", 0) or 0)
-        await cb.message.edit_text(
-            f"⏰ <b>تاخیر شروع ویو</b>\n\n"
-            f"فعلی: <b>{cur_delay:.0f} ثانیه</b>\n\n"
-            "تعداد ثانیه تاخیر رو بفرست (صفر = بدون تاخیر):\n"
-            "مثال: <code>3</code>  یا  <code>0</code>",
-            reply_markup=cancel_menu(),
-            parse_mode="HTML",
-        )
-        await state.set_state(_VGState.waiting_start_delay)
-        await cb.answer()
-        return
-
-    try:
-        await cb.answer()
-    except Exception:
-        pass
-
-
-@router.message(StateFilter(_VGState.waiting_daily_quota))
-async def vg_set_daily(msg: types.Message, state: FSMContext):
-    if not await guard(msg): return
-    raw = (msg.text or "").strip().translate(_FA_DIGITS)
-    if not raw.isdigit() or int(raw) < 1:
-        await msg.answer("❌ عدد معتبر وارد کن (مثال: <code>80</code>)", parse_mode="HTML")
-        return
-    import core.view_guard as vg
-    vg.MAX_VIEWS_PER_DAY = int(raw)
-    db.set_setting("vg_max_views_per_day", int(raw))
-    await msg.answer(
-        f"✅ سهمیه روزانه تنظیم شد: <b>{raw} ویو</b> برای هر اکانت",
-        reply_markup=main_menu(), parse_mode="HTML",
-    )
-    await state.clear()
-
-
-@router.message(StateFilter(_VGState.waiting_gap))
-async def vg_set_gap(msg: types.Message, state: FSMContext):
-    if not await guard(msg): return
-    parts = (msg.text or "").strip().translate(_FA_DIGITS).split()
-    if len(parts) != 2 or not all(p.isdigit() for p in parts):
-        await msg.answer("❌ فرمت اشتباه. مثال: <code>8 25</code>", parse_mode="HTML")
-        return
-    mn, mx = int(parts[0]), int(parts[1])
-    if mn < 1 or mx <= mn:
-        await msg.answer("❌ حداقل باید کمتر از حداکثر باشه.", parse_mode="HTML")
-        return
-    import core.view_guard as vg
-    vg.MIN_GAP_SEC = float(mn)
-    vg.MAX_GAP_SEC = float(mx)
-    db.set_setting("vg_min_gap", mn)
-    db.set_setting("vg_max_gap", mx)
-    await msg.answer(
-        f"✅ فاصله ویو تنظیم شد: <b>{mn}-{mx} ثانیه</b>",
-        reply_markup=main_menu(), parse_mode="HTML",
-    )
-    await state.clear()
-
-
-@router.message(StateFilter(_VGState.waiting_start_delay))
-async def vg_set_start_delay(msg: types.Message, state: FSMContext):
-    if not await guard(msg): return
-    raw = (msg.text or "").strip().translate(_FA_DIGITS)
-    if not raw.isdigit():
-        await msg.answer("❌ عدد معتبر وارد کن (مثال: <code>3</code> یا <code>0</code>)", parse_mode="HTML")
-        return
-    seconds = int(raw)
-    if seconds < 0 or seconds > 300:
-        await msg.answer("❌ بین صفر تا ۳۰۰ ثانیه وارد کن.", parse_mode="HTML")
-        return
-    db.set_setting("view_start_delay", seconds)
-    if seconds == 0:
-        label = "بدون تاخیر (فوری)"
-    else:
-        label = f"{seconds} ثانیه"
-    await msg.answer(
-        f"✅ تاخیر شروع ویو تنظیم شد: <b>{label}</b>",
-        reply_markup=main_menu(), parse_mode="HTML",
-    )
-    await state.clear()
 
 
 # ═══════════════════════════════════════════════════════════════

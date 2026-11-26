@@ -142,7 +142,6 @@ def settings_menu() -> InlineKeyboardMarkup:
     b.button(text="🔢 تعداد شیفت‌ها",         callback_data="set:num_shifts")
     b.button(text="🛡️ وضعیت نگهبان",         callback_data="set:guardian")
     b.button(text="💾 بکاپ",                  callback_data="set:backup")
-    b.button(text="🔒 تنظیمات ضد لیمیت",     callback_data="set:viewguard")
     b.button(text="🔙 برگشت",                 callback_data="menu:main")
     b.adjust(2)
     return b.as_markup()
@@ -164,17 +163,6 @@ def smart_scheduler_menu(mode: str) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def viewguard_menu() -> InlineKeyboardMarkup:
-    """منوی تنظیمات ViewGuard"""
-    b = InlineKeyboardBuilder()
-    b.button(text="📊 آمار لحظه‌ای",        callback_data="vg:stats")
-    b.button(text="🔄 ریست آمار امروز",     callback_data="vg:reset")
-    b.button(text="⚙️ تنظیم سهمیه روزانه",   callback_data="vg:set_daily")
-    b.button(text="⏳ تنظیم فاصله ویو",     callback_data="vg:set_gap")
-    b.button(text="⏰ تاخیر شروع ویو",     callback_data="vg:set_start_delay")
-    b.button(text="🔙 برگشت",               callback_data="menu:settings")
-    b.adjust(2)
-    return b.as_markup()
 
 
 def group_menu() -> InlineKeyboardMarkup:
