@@ -303,12 +303,12 @@ async def ensure_group_listener():
 class GroupListener:
     """هر پیام جدید گروه/کانال رو با همه‌ی اکانت‌های شیفت فعال ویو می‌کنه و/یا می‌خونه."""
 
-    MAX_GROUP_MSG_AGE  = 60    # ثانیه — پیام‌های قدیمی‌تر skip می‌شن
+    MAX_GROUP_MSG_AGE  = 300   # ثانیه — پیام‌های قدیمی‌تر skip می‌شن (۵ دقیقه، برای ساعت شلوغ)
     MAX_GROUP_QUEUE    = 50
     POLL_INTERVAL      = 1.5   # ثانیه بین هر poll
     BAD_PHONE_COOLDOWN = 300   # اکانتی که نتونست گروه رو بخونه تا ۵ دقیقه کنار می‌ره
     SETTINGS_EVERY     = 10    # هر چند ثانیه تنظیمات از دیتابیس دوباره خونده بشه
-    MAX_CATCHUP        = 600   # پیامی که تا ۱۰ دقیقه پیش اومده و جا مونده، هنوز پردازش میشه
+    MAX_CATCHUP        = 1200  # پیامی که تا ۲۰ دقیقه پیش اومده و جا مونده، هنوز پردازش میشه
     POLL_FAIL_LIMIT    = 3     # چند poll ناموفق پشت هم تا خواننده عوض بشه
 
     def __init__(self, num_workers: int = 4):
@@ -424,10 +424,23 @@ class GroupListener:
 
     # ───────────────── ensure client ─────────────────
     async def _pick_client(self):
-        """اولین اکانت سالمی که قبلاً نشکسته؛ اول اونایی که همین الان وصلن."""
+        """اولین اکانت سالمی که قبلاً نشکسته و flood/error/dead نیست؛ اول وصل‌ها."""
         now = _time.time()
-        cands = [p for p in POOL.all_phones
-                 if p not in POOL.blacklist and self._bad.get(p, 0) < now]
+        # اکانت‌های flood/error/dead از DB بخون تا لیسنر روشون وصل نشه
+        try:
+            bad_statuses = {
+                r["phone"] for r in db.get_all_accounts()
+                if r.get("status") in ("flood", "error", "dead")
+            }
+        except Exception:
+            bad_statuses = set()
+
+        cands = [
+            p for p in POOL.all_phones
+            if p not in POOL.blacklist
+            and self._bad.get(p, 0) < now
+            and p not in bad_statuses
+        ]
         cands.sort(key=lambda p: 0 if POOL._is_live(p) else 1)
         for phone in cands[:15]:
             c = await POOL.get(phone)
