@@ -2581,7 +2581,8 @@ async def add_session(msg: types.Message, state: FSMContext):
         pool_ok = False
         try:
             from core.pool import POOL
-            pool_ok = await asyncio.wait_for(POOL.add_account_live(phone_key), timeout=40) is not None
+            asyncio.create_task(POOL.add_account_live(phone_key))  # fire-and-forget
+            pool_ok = True
         except Exception as _pe:
             db.debug_log("handlers", "pool_add_session", "WARN", f"{type(_pe).__name__}: {_pe}")
 
@@ -2709,7 +2710,8 @@ async def add_session_file(msg: types.Message, state: FSMContext, bot: Bot):
         pool_ok = False
         try:
             from core.pool import POOL
-            pool_ok = await asyncio.wait_for(POOL.add_account_live(phone_key), timeout=40) is not None
+            asyncio.create_task(POOL.add_account_live(phone_key))  # fire-and-forget
+            pool_ok = True
         except Exception as _pe:
             db.debug_log("handlers", "pool_add_session_file", "WARN", f"{type(_pe).__name__}: {_pe}")
 
@@ -3080,7 +3082,8 @@ async def add_code(msg: types.Message, state: FSMContext):
         pool_ok = False
         try:
             from core.pool import POOL
-            pool_ok = await asyncio.wait_for(POOL.add_account_live(phone), timeout=40) is not None
+            asyncio.create_task(POOL.add_account_live(phone))  # fire-and-forget
+            pool_ok = True
         except Exception as _pe:
             db.debug_log("handlers", "pool_add", "WARN", f"{type(_pe).__name__}: {_pe}")
 
