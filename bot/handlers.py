@@ -12,7 +12,15 @@ from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError, FloodWaitError
+from telethon.errors import (
+    SessionPasswordNeededError, FloodWaitError,
+    PhoneMigrateError, NetworkMigrateError, UserMigrateError,
+    PhoneCodeInvalidError, PhoneCodeExpiredError, PhoneCodeEmptyError,
+    PhoneNumberInvalidError, PhoneNumberBannedError, PhoneNumberFloodError,
+    PhoneNumberUnoccupiedError,
+    AuthRestartError, AuthKeyError, SessionRevokedError,
+    ApiIdInvalidError,
+)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import Config
@@ -56,19 +64,34 @@ _FA_DIGITS = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567
 
 
 def _normalize_phone(raw: str) -> str | None:
-    """ارقام فارسی/عربی، فاصله، خط تیره و پیشوندهای 09xx / 98xx / 00xx رو به +E.164 تبدیل می‌کنه."""
+    """
+    تبدیل هر فرمت شماره به E.164 — پشتیبانی از همه کشورها:
+    - ارقام فارسی/عربی
+    - فاصله، خط‌تیره، پرانتز، نقطه (مثل +1 (555) 123-4567)
+    - پیشوند 00xx، 09xx، 98xx (ایران)
+    - شماره‌های بدون + که ۱۰+ رقمی هستن
+    """
+    # ترجمه ارقام فارسی/عربی
     s = raw.translate(_FA_DIGITS)
+    # حذف کاراکترهای غیرضروری (پرانتز، خط‌تیره، فاصله، نقطه)
     s = "".join(ch for ch in s if ch.isdigit() or ch == "+")
+    # حذف + تکراری (مثل ++98)
+    if s.count("+") > 1:
+        s = "+" + s.replace("+", "")
+    # تبدیل پیشوندها
     if s.startswith("00"):
         s = "+" + s[2:]
-    elif s.startswith("09") and len(s) == 11:
+    elif s.startswith("09") and 10 <= len(s) <= 11:
         s = "+98" + s[1:]
+    elif s.startswith("989") and len(s) == 12:
+        s = "+" + s
     elif s.startswith("98") and len(s) == 12:
         s = "+" + s
     elif not s.startswith("+") and s.isdigit() and len(s) >= 10:
         s = "+" + s
-    digits = s[1:]
-    if not s.startswith("+") or not digits.isdigit() or not (10 <= len(digits) <= 15):
+    # اعتبارسنجی E.164: + و ۷ تا ۱۵ رقم
+    digits = s[1:] if s.startswith("+") else ""
+    if not digits or not digits.isdigit() or not (7 <= len(digits) <= 15):
         return None
     return s
 
@@ -2782,17 +2805,7 @@ async def add_phone(msg: types.Message, state: FSMContext):
 
     async def _do_send_code() -> None:
         nonlocal c
-        c = TelegramClient(
-            StringSession(),
-            Config.API_ID,
-            Config.API_HASH,
-            connection_retries=3,
-            retry_delay=2,
-            timeout=25,
-        )
-        # اول proxy اختصاصی این شماره رو چک کن (account_proxy.json)
-        # اگه نبود، از pool WARP یه port سالم بگیر
-        # این برای شماره‌های غیر ایرانی (+1, +44, ...) که DC فرق دارن حیاتیه
+        # انتخاب proxy
         px = None
         try:
             from core.proxy_loader import get_proxy_for
@@ -2801,20 +2814,90 @@ async def add_phone(msg: types.Message, state: FSMContext):
             pass
         if not px:
             px = _pick_warp_proxy()
-        if px:
-            c.set_proxy(px)
-        await asyncio.wait_for(c.connect(), timeout=25)
-        sent = await asyncio.wait_for(c.send_code_request(phone), timeout=30)
+
+        def _make_fresh_client(session=None, dc_id=None) -> TelegramClient:
+            """ساخت کلاینت با پارامترهای کامل برای همه کشورها"""
+            import random
+            # device info های متنوع برای کاهش محدودیت
+            devices = [
+                ("Samsung Galaxy S23", "Android 13", "2.0.0"),
+                ("iPhone 14 Pro",      "iOS 16.5",   "9.6.3"),
+                ("Pixel 7",            "Android 13", "2.0.0"),
+                ("Xiaomi 13",          "Android 13", "2.0.0"),
+                ("iPhone 15",          "iOS 17.0",   "9.7.1"),
+            ]
+            device, system, app_ver = random.choice(devices)
+            kwargs = dict(
+                api_id=Config.API_ID,
+                api_hash=Config.API_HASH,
+                device_model=device,
+                system_version=system,
+                app_version=app_ver,
+                lang_code="en",
+                system_lang_code="en-US",
+                connection_retries=5,
+                retry_delay=2,
+                timeout=30,
+                request_retries=3,
+                flood_sleep_threshold=0,   # همیشه FloodWaitError بزنه، خودمون handle می‌کنیم
+            )
+            cl = TelegramClient(
+                StringSession(session or ""),
+                **kwargs,
+            )
+            if dc_id:
+                cl.session.set_dc(dc_id, None, None)
+            if px:
+                cl.set_proxy(px)
+            return cl
+
+        c = _make_fresh_client()
+        await asyncio.wait_for(c.connect(), timeout=30)
+
+        sent = None
+        try:
+            sent = await asyncio.wait_for(c.send_code_request(phone), timeout=35)
+
+        except (PhoneMigrateError, NetworkMigrateError, UserMigrateError) as migrate_err:
+            # شماره به DC دیگه‌ای تعلق داره — Telethon باید خودکار migrate کنه
+            # ولی وقتی proxy هست گاهی اتفاق نمی‌افته، دستی handle می‌کنیم
+            dc_id = migrate_err.new_dc
+            try: await c.disconnect()
+            except Exception: pass
+
+            c = _make_fresh_client(dc_id=dc_id)
+            # برای DC جدید باید reconnect کنیم
+            await asyncio.wait_for(c.connect(), timeout=30)
+            sent = await asyncio.wait_for(c.send_code_request(phone), timeout=35)
+
+        except PhoneNumberInvalidError:
+            raise Exception("PHONE_NUMBER_INVALID")
+        except PhoneNumberBannedError:
+            raise Exception("PHONE_NUMBER_BANNED")
+        except PhoneNumberFloodError:
+            raise Exception("PHONE_NUMBER_FLOOD — این شماره موقتاً از ارسال کد محدود شده")
+        except ApiIdInvalidError:
+            raise Exception("API_ID_INVALID — API_ID یا API_HASH اشتباهه")
+        except AuthRestartError:
+            raise Exception("AUTH_RESTART — session خراب شده، دوباره شروع کن")
+
+        # ذخیره session string بعد از send_code (اطلاعات DC و salt در آن هست)
+        session_after_send = c.session.save()
+
         _pending_clients[msg.from_user.id] = c
         await state.update_data(
             phone=phone,
             phone_code_hash=sent.phone_code_hash,
-            send_code_proxy=px,          # ذخیره می‌کنیم تا sign_in هم از همون proxy استفاده کنه
+            send_code_proxy=px,
+            session_after_send=session_after_send,
         )
         await state.set_state(AddAccount.waiting_code)
-        proxy_note = f" <i>(از WARP پورت {px['port']})</i>" if px else ""
+
+        proxy_note = f" <i>(WARP:{px['port']})</i>" if px else " <i>(مستقیم)</i>"
         await msg.answer(
-            f"✉️ <b>کد ارسال شد</b>{proxy_note}\n\nکد رو با اعداد انگلیسی وارد کن:",
+            f"✉️ <b>کد تأیید ارسال شد</b>{proxy_note}\n\n"
+            f"📱 شماره: <code>{phone}</code>\n\n"
+            f"کد ۵ رقمی رو وارد کن (اعداد انگلیسی):",
             parse_mode="HTML",
         )
 
@@ -2869,17 +2952,74 @@ async def add_phone(msg: types.Message, state: FSMContext):
                     parse_mode="HTML"
                 )
                 return
+        except PhoneNumberInvalidError:
+            await _cleanup_client()
+            await state.clear()
+            await msg.answer(
+                "❌ <b>شماره نامعتبر</b>\n\n"
+                "فرمت صحیح:\n"
+                "• ایران: <code>+989121234567</code>\n"
+                "• آمریکا: <code>+12125551234</code>\n"
+                "• انگلیس: <code>+447911123456</code>\n"
+                "• ترکیه: <code>+905321234567</code>",
+                parse_mode="HTML",
+            )
+            return
+        except PhoneNumberBannedError:
+            await _cleanup_client()
+            await state.clear()
+            await msg.answer(
+                "🚫 <b>این شماره توسط تلگرام بن شده</b>\n\n"
+                "این شماره قابل استفاده نیست.",
+            )
+            return
+        except PhoneNumberFloodError:
+            await _cleanup_client()
+            await state.clear()
+            await msg.answer(
+                "⚠️ <b>محدودیت موقت</b>\n\n"
+                "این شماره موقتاً از ارسال کد محدود شده.\n"
+                "چند ساعت دیگه دوباره امتحان کن.",
+            )
+            return
+        except PhoneNumberUnoccupiedError:
+            await _cleanup_client()
+            await state.clear()
+            await msg.answer(
+                "❌ <b>این شماره در تلگرام ثبت‌نام نشده</b>\n\n"
+                "شماره باید قبلاً یه‌بار وارد تلگرام شده باشه.",
+            )
+            return
+        except ApiIdInvalidError:
+            await _cleanup_client()
+            await state.clear()
+            await msg.answer("❌ <b>API_ID یا API_HASH اشتباهه</b>\n\nتنظیمات ربات رو بررسی کن.")
+            return
+        except (AuthRestartError, AuthKeyError):
+            await _cleanup_client()
+            await state.clear()
+            await msg.answer(
+                "🔄 <b>خطای احراز هویت</b>\n\n"
+                "دوباره از ابتدا شروع کن.",
+                reply_markup=main_menu(),
+            )
+            return
+        except asyncio.TimeoutError:
+            await _cleanup_client()
+            await state.clear()
+            await msg.answer(
+                "❌ <b>Timeout</b>\n\n"
+                "سرور تلگرام پاسخ نداد.\n"
+                "احتمالاً مشکل proxy یا اینترنت — دوباره امتحان کن.",
+            )
+            return
         except Exception as e:
             await _cleanup_client()
             await state.clear()
             err = str(e)
-            hint = ""
-            if "PHONE_NUMBER_INVALID" in err:   hint = "\n📌 فرمت شماره اشتباهه"
-            elif "PHONE_NUMBER_BANNED" in err:  hint = "\n📌 این شماره توسط تلگرام بن شده"
-            elif "AUTH_RESTART" in err:         hint = "\n📌 session خراب شده — دوباره شروع کن"
             await msg.answer(
-                f"❌ <b>خطا</b>: <code>{err[:200]}</code>{hint}",
-                parse_mode="HTML"
+                f"❌ <b>خطا:</b> <code>{err[:250]}</code>",
+                parse_mode="HTML",
             )
             return
 
@@ -2887,24 +3027,35 @@ async def add_phone(msg: types.Message, state: FSMContext):
 @router.message(StateFilter(AddAccount.waiting_code))
 async def add_code(msg: types.Message, state: FSMContext):
     if not await guard(msg): return
-    code  = msg.text.strip().replace("-", "").replace(" ", "")
+    # نرمال‌سازی کد — ارقام فارسی، فاصله، خط‌تیره
+    raw_code = (msg.text or "").strip().translate(_FA_DIGITS)
+    code = "".join(ch for ch in raw_code if ch.isdigit())
+    if not code or len(code) < 4:
+        await msg.answer("❌ کد معتبر نیست. فقط اعداد وارد کن (مثلاً: <code>12345</code>)", parse_mode="HTML")
+        return
+
     data  = await state.get_data()
     phone = data["phone"]
     c     = _pending.get(msg.from_user.id)
     if not c:
-        await msg.answer("❌ کلاینت پیدا نشد. دوباره شروع کن.")
+        await msg.answer(
+            "❌ کلاینت پیدا نشد (احتمالاً ربات ریستارت شده).\n"
+            "دوباره از منوی افزودن اکانت شروع کن."
+        )
         await state.clear()
         return
     try:
-        await c.sign_in(phone, code, phone_code_hash=data["phone_code_hash"])
+        await asyncio.wait_for(
+            c.sign_in(phone, code, phone_code_hash=data["phone_code_hash"]),
+            timeout=30,
+        )
         ss   = c.session.save()
-        me   = await c.get_me()
+        me   = await asyncio.wait_for(c.get_me(), timeout=15)
         await _join_group(c)
         await c.disconnect()
         _pending.pop(msg.from_user.id, None)
         acc_id = db.add_account(phone, ss)
 
-        # اکانت جدید رو بلافاصله وارد pool کن (با کلاینت تازه، نه کلاینت قطع‌شده)
         pool_ok = False
         try:
             from core.pool import POOL
@@ -2924,11 +3075,56 @@ async def add_code(msg: types.Message, state: FSMContext):
             parse_mode="HTML",
         )
         await state.clear()
+
     except SessionPasswordNeededError:
         await msg.answer("🔐 <b>رمز دو مرحله‌ای</b>\n\nرمز رو وارد کن:", parse_mode="HTML")
         await state.set_state(AddAccount.waiting_password)
+
+    except PhoneCodeInvalidError:
+        await msg.answer(
+            "❌ <b>کد اشتباهه!</b>\n\n"
+            "دقت کن:\n"
+            "• کد باید انگلیسی باشه\n"
+            "• کد منقضی نشده باشه\n\n"
+            "دوباره کد رو وارد کن:"
+        )
+        # state رو پاک نمی‌کنیم — کاربر می‌تونه دوباره امتحان کنه
+
+    except PhoneCodeExpiredError:
+        await msg.answer(
+            "⏰ <b>کد منقضی شد!</b>\n\n"
+            "کد تلگرام فقط ۵ دقیقه معتبره.\n"
+            "دوباره از ابتدا شماره رو وارد کن.",
+            reply_markup=main_menu(),
+        )
+        try: await c.disconnect()
+        except Exception: pass
+        _pending.pop(msg.from_user.id, None)
+        await state.clear()
+
+    except PhoneCodeEmptyError:
+        await msg.answer("❌ کد خالیه. کد رو وارد کن:")
+
+    except (AuthRestartError, AuthKeyError, SessionRevokedError):
+        await msg.answer(
+            "🔄 <b>خطای احراز هویت</b>\n\n"
+            "لطفاً دوباره از ابتدا شروع کن.",
+            reply_markup=main_menu(),
+        )
+        try: await c.disconnect()
+        except Exception: pass
+        _pending.pop(msg.from_user.id, None)
+        await state.clear()
+
+    except asyncio.TimeoutError:
+        await msg.answer("❌ <b>Timeout</b> — سرور پاسخ نداد. دوباره امتحان کن.")
+
     except Exception as e:
-        await msg.answer(f"❌ خطا: <code>{e}</code>", parse_mode="HTML")
+        err = str(e)
+        hint = ""
+        if "2FA" in err.upper() or "password" in err.lower():
+            hint = "\n\n📌 شاید رمز دو مرحله‌ای روشن باشه؟"
+        await msg.answer(f"❌ <b>خطا:</b> <code>{err[:200]}</code>{hint}", parse_mode="HTML")
         try: await c.disconnect()
         except Exception: pass
         _pending.pop(msg.from_user.id, None)
