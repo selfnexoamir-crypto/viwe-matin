@@ -185,58 +185,38 @@ class SelfHealGuardian:
 
 
     async def _heal_accounts(self):
-        """اکانت‌های flood/error رو ترمیم کن و بعد از ریکاوری دوباره به pool وصل کن"""
-        from core.pool import POOL
+        """اکانت‌های flood/error رو ترمیم کن"""
         accounts = db.get_all_accounts()
-        healed = []
 
         for acc in accounts:
             if acc["status"] not in ("flood", "error"):
                 continue
 
             phone = acc["phone"]
-
             # چک کن flood_until تموم شده
             if acc["status"] == "flood" and acc.get("flood_until"):
                 try:
                     until = datetime.fromisoformat(acc["flood_until"])
-                    if until > datetime.utcnow():
-                        # هنوز در flood‌ایم — رد کن
+                    if until < datetime.utcnow():
+                        db.update_account_status(phone, "idle")
+                        db.debug_log("self_heal", "heal", "OK",
+                                     f"{phone}: flood تموم شد → idle")
                         continue
                 except Exception:
                     pass
-                # flood تموم شده → idle + reconnect
-                db.update_account_status(phone, "idle")
-                db.debug_log("self_heal", "heal", "OK",
-                             f"{phone}: flood تموم شد → idle")
-                healed.append(phone)
-                continue
 
             # اگه error هست، try جدید بزن
             if acc["status"] == "error":
-                recovered = await self._retry_account(phone)
-                if recovered:
-                    healed.append(phone)
+                # با WARP جدید تست کن
+                await self._retry_account(phone)
 
-        # اکانت‌های ریکاوری‌شده رو به pool فعلی وصل کن
-        if healed:
-            db.debug_log("self_heal", "reconnect", "OK",
-                         f"{len(healed)} اکانت heal شد → reconnect: {healed}")
-            try:
-                await POOL.ensure_connected(healed, force=True, limit=len(healed))
-                db.debug_log("self_heal", "reconnect", "DONE",
-                             f"اتصال مجدد {len(healed)} اکانت انجام شد")
-            except Exception as e:
-                db.debug_log("self_heal", "reconnect", "ERROR",
-                             f"{type(e).__name__}: {e}")
-
-    async def _retry_account(self, phone) -> bool:
-        """تلاش مجدد برای یه اکانت با WARP متفاوت — True اگه ریکاوری شد"""
+    async def _retry_account(self, phone):
+        """تلاش مجدد برای یه اکانت با WARP متفاوت"""
         try:
             from core.engine import make_client, health_check
             ss = db.get_session(phone)
             if not ss:
-                return False
+                return
             client = make_client(ss, phone=phone + "_retry")  # hash متفاوت → IP متفاوت
             await asyncio.wait_for(client.connect(), timeout=20)
             h = await health_check(client)
@@ -244,11 +224,8 @@ class SelfHealGuardian:
             if h["status"] == "ok":
                 db.update_account_status(phone, "idle")
                 db.debug_log("self_heal", "retry", "OK", f"{phone} → idle")
-                return True
-            return False
         except Exception as e:
             db.debug_log("self_heal", "retry", "WARN", f"{phone}: {type(e).__name__}")
-            return False
 
     async def _restart_dead_proxies(self):
         """wireproxyهای مرده رو دوباره راه‌اندازی کن"""

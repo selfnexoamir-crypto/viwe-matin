@@ -6,6 +6,7 @@ from aiogram.types import (
 from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
 
 
+
 def main_menu() -> ReplyKeyboardMarkup:
     b = ReplyKeyboardBuilder()
     b.row(KeyboardButton(text="➕ افزودن اکانت"),   KeyboardButton(text="📊 وضعیت زنده"))
@@ -22,7 +23,49 @@ def use_members_menu() -> InlineKeyboardMarkup:
     b.button(text="🚀 استارت ربات",          callback_data="mem:start_bot")
     b.button(text="👥 عضو شدن توی گروه",     callback_data="mem:join_group")
     b.button(text="🔗 جوین توی جوین اجباری", callback_data="mem:forced_join")
+    b.button(text="📌 ثبت کانال ثابت",       callback_data="mem:fixed_channel")
     b.button(text="🔙 برگشت",                callback_data="menu:main")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def fixed_channel_confirm_menu(channel_username: str) -> InlineKeyboardMarkup:
+    """منوی تأیید/رد کانال ثابت"""
+    b = InlineKeyboardBuilder()
+    b.button(text="✅ تایید",  callback_data=f"fch:confirm:{channel_username}")
+    b.button(text="❌ رد",     callback_data="fch:reject")
+    b.adjust(2)
+    return b.as_markup()
+
+
+def fixed_channels_list_menu(channels: list[dict]) -> InlineKeyboardMarkup:
+    """لیست کانال‌های ثابت با دکمه‌های اجرا و حذف"""
+    b = InlineKeyboardBuilder()
+    for ch in channels:
+        slug = ch["username"]
+        title = ch.get("title", slug)
+        # ردیف: نام کانال (اجرا) + دکمه حذف
+        b.row(
+            InlineKeyboardButton(
+                text=f"▶️ {title}",
+                callback_data=f"fch:run:{slug}",
+            ),
+            InlineKeyboardButton(
+                text="🗑",
+                callback_data=f"fch:del:{slug}",
+            ),
+        )
+    b.row(InlineKeyboardButton(text="➕ افزودن کانال جدید", callback_data="fch:add"))
+    b.row(InlineKeyboardButton(text="🔙 برگشت",             callback_data="mem:back"))
+    return b.as_markup()
+
+
+def fixed_channel_actions_menu(channel_username: str) -> InlineKeyboardMarkup:
+    """منوی عملیات روی یک کانال ثابت (نگه داشته برای سازگاری)"""
+    b = InlineKeyboardBuilder()
+    b.button(text="▶️ اجرا (جوین + ویو + ری‌اکشن)", callback_data=f"fch:run:{channel_username}")
+    b.button(text="🗑 حذف این کانال",                callback_data=f"fch:del:{channel_username}")
+    b.button(text="🔙 برگشت به لیست",                callback_data="fch:list")
     b.adjust(1)
     return b.as_markup()
 
@@ -142,6 +185,7 @@ def settings_menu() -> InlineKeyboardMarkup:
     b.button(text="🔢 تعداد شیفت‌ها",         callback_data="set:num_shifts")
     b.button(text="🛡️ وضعیت نگهبان",         callback_data="set:guardian")
     b.button(text="💾 بکاپ",                  callback_data="set:backup")
+    b.button(text="🔒 تنظیمات ضد لیمیت",     callback_data="set:viewguard")
     b.button(text="🔙 برگشت",                 callback_data="menu:main")
     b.adjust(2)
     return b.as_markup()
@@ -163,6 +207,17 @@ def smart_scheduler_menu(mode: str) -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
+def viewguard_menu() -> InlineKeyboardMarkup:
+    """منوی تنظیمات ViewGuard"""
+    b = InlineKeyboardBuilder()
+    b.button(text="📊 آمار لحظه‌ای",        callback_data="vg:stats")
+    b.button(text="🔄 ریست آمار امروز",     callback_data="vg:reset")
+    b.button(text="⚙️ تنظیم سهمیه روزانه",   callback_data="vg:set_daily")
+    b.button(text="⏳ تنظیم فاصله ویو",     callback_data="vg:set_gap")
+    b.button(text="⏰ تاخیر شروع ویو",     callback_data="vg:set_start_delay")
+    b.button(text="🔙 برگشت",               callback_data="menu:settings")
+    b.adjust(2)
+    return b.as_markup()
 
 
 def group_menu() -> InlineKeyboardMarkup:

@@ -24,8 +24,10 @@ from bot.keyboards import (
     use_members_menu, num_shifts_menu,
     forced_join_menu, forced_join_settings_menu,
     add_method_menu, smart_scheduler_menu,
+    fixed_channel_confirm_menu, fixed_channel_actions_menu,
+    fixed_channels_list_menu,
 )
-from bot.states import AddAccount, SetShiftTiming, SetGroup, UseMembers, StartBotWizard
+from bot.states import AddAccount, SetShiftTiming, SetGroup, UseMembers, StartBotWizard, FixedChannel
 
 router = Router()
 
@@ -494,6 +496,10 @@ async def cb_use_members(cb: types.CallbackQuery, state: FSMContext):
             parse_mode="HTML",
         )
 
+    elif action == "fixed_channel":
+        await cb.answer()
+        await _show_fixed_channels_list(cb.message)
+
     elif action == "back":
         await cb.answer()
         total = len(db.get_all_accounts())
@@ -510,6 +516,520 @@ async def cb_use_members(cb: types.CallbackQuery, state: FSMContext):
         await cb.answer()
     except Exception:
         pass
+
+
+# ─────────────────────────────────────────────────────────
+# 📌 کانال‌های ثابت (چندکاناله) — helpers
+# ─────────────────────────────────────────────────────────
+
+import json as _json
+
+_ALL_REACTIONS = [
+    "👍","👎","❤️","🔥","🥰","👏","😁","🤔","🤯","😱","🤬","😢","🎉","🤩",
+    "🤮","💩","🙏","👌","🕊","🤡","🥱","🥴","😍","🐳","❤️‍🔥","🌚","🌭","💯",
+    "🤣","⚡","🍌","🏆","💔","🤨","😐","🍓","🍾","💋","🖕","😈","😴","😭",
+    "🤓","👻","👨‍💻","👀","🎃","🙈","😇","😨","🤝","✍️","🤗","🫡","🎅","🎄",
+    "☃️","💅","🤪","🗿","🆒","💘","🙉","🦄","😘","💊","🙊","😎","👾","🤷",
+    "🤷‍♂️","🤷‍♀️","😡",
+]
+_DEFAULT_REACTIONS = ["👍","❤️","🔥","🎉","😁","🤔"]
+
+
+def _fch_load() -> list[dict]:
+    """لیست کانال‌های ثابت را از DB می‌خواند — [{username, title, reactions}, ...]"""
+    raw = db.get_setting("fixed_channels_v2", "")
+    if not raw:
+        return []
+    try:
+        return _json.loads(raw)
+    except Exception:
+        return []
+
+
+def _fch_save(channels: list[dict]):
+    """لیست کانال‌های ثابت را در DB ذخیره می‌کند"""
+    db.set_setting("fixed_channels_v2", _json.dumps(channels, ensure_ascii=False))
+
+
+def _fch_add(username: str, title: str, reactions: list[str]):
+    """کانال جدید اضافه می‌کند (اگر قبلاً نبود)"""
+    channels = _fch_load()
+    for ch in channels:
+        if ch["username"] == username:
+            ch["title"] = title
+            ch["reactions"] = reactions
+            _fch_save(channels)
+            return
+    channels.append({"username": username, "title": title, "reactions": reactions})
+    _fch_save(channels)
+
+
+def _fch_remove(username: str):
+    """کانال را از لیست حذف می‌کند"""
+    channels = [ch for ch in _fch_load() if ch["username"] != username]
+    _fch_save(channels)
+
+
+async def _show_fixed_channels_list(msg: types.Message):
+    """نمایش لیست کانال‌های ثابت"""
+    channels = _fch_load()
+    count = len(channels)
+    if count == 0:
+        text = (
+            "📌 <b>کانال‌های ثابت</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            "هنوز هیچ کانالی ثبت نشده.\n\n"
+            "با دکمه زیر کانال اضافه کن:"
+        )
+    else:
+        lines = "\n".join(
+            f"  • <code>@{ch['username']}</code> — {ch.get('title', ch['username'])}"
+            for ch in channels
+        )
+        text = (
+            f"📌 <b>کانال‌های ثابت ({count} کانال)</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{lines}\n\n"
+            f"▶️ = اجرا (جوین + ری‌اکشن)   🗑 = حذف"
+        )
+    await msg.answer(text, reply_markup=fixed_channels_list_menu(channels), parse_mode="HTML")
+
+
+# ─────────────────────────────────────────────────────────
+# 📌 کانال‌های ثابت — کال‌بک‌ها
+# ─────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "fch:list")
+async def fch_list(cb: types.CallbackQuery):
+    await cb.answer()
+    await _show_fixed_channels_list(cb.message)
+
+
+@router.callback_query(F.data == "fch:add")
+async def fch_add(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await cb.message.answer(
+        "📌 <b>افزودن کانال ثابت</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "لینک یا یوزرنیم کانال رو بفرست:\n"
+        "<code>https://t.me/channelusername</code>\n"
+        "یا\n"
+        "<code>@channelusername</code>",
+        reply_markup=cancel_menu(),
+        parse_mode="HTML",
+    )
+    await state.set_state(FixedChannel.waiting_link)
+
+
+@router.message(StateFilter(FixedChannel.waiting_link))
+async def fch_receive_link(msg: types.Message, state: FSMContext):
+    """دریافت لینک کانال و نمایش مشخصات برای تأیید"""
+    if not await guard(msg): return
+    raw = (msg.text or "").strip()
+    if not raw:
+        await msg.answer("❌ لینک خالیه. دوباره بفرست یا انصراف بزن.")
+        return
+
+    import re
+    channel_target = None
+    link_match = re.match(r"(?:https?://)?t\.me/([A-Za-z0-9_]+)", raw)
+    if link_match:
+        channel_target = link_match.group(1)
+    elif raw.startswith("@"):
+        channel_target = raw[1:]
+    elif raw.lstrip("-").isdigit():
+        channel_target = raw
+    else:
+        channel_target = raw.lstrip("@")
+
+    if not channel_target:
+        await msg.answer("❌ لینک معتبر نیست. دوباره بفرست.")
+        return
+
+    await msg.answer("⏳ در حال دریافت اطلاعات کانال...")
+    from core.engine import make_client
+    accounts = db.get_all_accounts()
+    if not accounts:
+        await msg.answer("❌ هیچ اکانتی موجود نیست.", reply_markup=cancel_menu())
+        return
+
+    client = None
+    channel_info = None
+    try:
+        a = accounts[0]
+        client = make_client(db.get_session(a["phone"]), phone=a["phone"])
+        await asyncio.wait_for(client.connect(), timeout=15)
+        entity = await asyncio.wait_for(client.get_entity(channel_target), timeout=15)
+        title       = getattr(entity, "title", channel_target)
+        username    = getattr(entity, "username", None) or channel_target
+        members_cnt = getattr(entity, "participants_count", "نامشخص")
+        channel_id  = getattr(entity, "id", "نامشخص")
+        channel_info = {
+            "title":    title,
+            "username": username,
+            "members":  members_cnt,
+            "id":       channel_id,
+        }
+    except Exception as e:
+        await msg.answer(
+            f"❌ نتونستم اطلاعات کانال رو بگیرم:\n<code>{e}</code>\n\nدوباره امتحان کن.",
+            reply_markup=cancel_menu(),
+            parse_mode="HTML",
+        )
+        return
+    finally:
+        if client:
+            try: await client.disconnect()
+            except Exception: pass
+
+    await state.update_data(channel_target=channel_target, channel_info=channel_info)
+    await state.set_state(FixedChannel.waiting_confirm)
+
+    info = channel_info
+    await msg.answer(
+        f"📌 <b>تأیید کانال</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📛 نام: <b>{info['title']}</b>\n"
+        f"🔗 یوزرنیم: <code>@{info['username']}</code>\n"
+        f"👥 اعضا: <b>{info['members']}</b>\n"
+        f"🆔 آیدی: <code>{info['id']}</code>\n\n"
+        f"آیا این کانال صحیح است؟",
+        reply_markup=fixed_channel_confirm_menu(channel_target),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("fch:confirm:"))
+async def fch_confirm(cb: types.CallbackQuery, state: FSMContext):
+    """ذخیره کانال در لیست چندکاناله"""
+    await cb.answer()
+    channel_target = cb.data.split("fch:confirm:")[1]
+    data = await state.get_data()
+    info = data.get("channel_info", {})
+    title = info.get("title", channel_target)
+    await state.clear()
+
+    # ذخیره بدون ری‌اکشن — هنگام اجرا دریافت می‌شه
+    _fch_add(channel_target, title, [])
+
+    channels = _fch_load()
+    await cb.message.answer(
+        f"✅ <b>کانال اضافه شد</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📛 {title}  (<code>@{channel_target}</code>)\n\n"
+        f"اکنون {len(channels)} کانال ثابت دارید.",
+        reply_markup=fixed_channels_list_menu(channels),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data == "fch:reject")
+async def fch_reject(cb: types.CallbackQuery, state: FSMContext):
+    """رد کانال — برگشت به ورود لینک"""
+    await cb.answer()
+    await state.set_state(FixedChannel.waiting_link)
+    await cb.message.answer(
+        "📌 <b>افزودن کانال ثابت</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "لینک کانال جدید رو بفرست:\n"
+        "<code>https://t.me/channelusername</code>",
+        reply_markup=cancel_menu(),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("fch:del:"))
+async def fch_del(cb: types.CallbackQuery):
+    """حذف یک کانال از لیست"""
+    await cb.answer()
+    slug = cb.data.split("fch:del:")[1]
+    _fch_remove(slug)
+    channels = _fch_load()
+    await cb.message.answer(
+        f"🗑 <b>کانال <code>@{slug}</code> حذف شد.</b>\n\n"
+        f"اکنون {len(channels)} کانال ثابت دارید.",
+        reply_markup=fixed_channels_list_menu(channels),
+        parse_mode="HTML",
+    )
+
+
+@router.callback_query(F.data.startswith("fch:run:"))
+async def fch_run(cb: types.CallbackQuery):
+    """اجرای جوین + ری‌اکشن روی یک کانال"""
+    await cb.answer("⏳ شروع عملیات...", show_alert=True)
+    channel_target = cb.data.split("fch:run:")[1]
+    asyncio.create_task(_fixed_channel_run_task(cb.message, channel_target))
+
+
+# ─────────────────────────────────────────────────────────
+# 📌 کانال‌های ثابت — task اجرا
+# ─────────────────────────────────────────────────────────
+
+async def _fetch_channel_reactions(client, channel_target: str) -> list[str]:
+    """ری‌اکشن‌های مجاز کانال را از Telegram دریافت می‌کند"""
+    from telethon.tl.functions.channels import GetFullChannelRequest
+    from telethon.tl.types import ChatReactionsSome, ChatReactionsAll
+    try:
+        full = await asyncio.wait_for(client(GetFullChannelRequest(channel_target)), timeout=20)
+        ar = getattr(full.full_chat, "available_reactions", None)
+        if isinstance(ar, ChatReactionsSome):
+            result = [r.emoticon for r in ar.reactions if hasattr(r, "emoticon")]
+            return result if result else _DEFAULT_REACTIONS
+        elif isinstance(ar, ChatReactionsAll):
+            return _ALL_REACTIONS
+    except Exception:
+        pass
+    return _DEFAULT_REACTIONS
+
+
+async def _fixed_channel_run_task(msg: types.Message, channel_target: str):
+    """
+    برای یک کانال:
+    ۱) جوین همه اکانت‌ها
+    ۲) دریافت ری‌اکشن‌های مجاز
+    ۳) ری‌اکشن تصادفی روی آخرین پست
+    ۴) listener دائمی (اگه قبلاً راه‌اندازی نشده)
+    """
+    import random
+    from core.engine import make_client
+    from telethon.tl.functions.channels import JoinChannelRequest
+    from telethon.tl.functions.messages import SendReactionRequest
+    from telethon.tl.types import ReactionEmoji
+
+    accounts = db.get_all_accounts()
+    if not accounts:
+        await msg.answer("❌ هیچ اکانتی موجود نیست.")
+        return
+
+    # ── مرحله ۱: جوین ──
+    progress = await msg.answer(
+        f"⏳ <b>[{channel_target}] مرحله ۱: عضویت</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"0 / {len(accounts)} اکانت...",
+        parse_mode="HTML",
+    )
+    ok_join = 0
+    for idx, a in enumerate(accounts, 1):
+        c = None
+        try:
+            c = make_client(db.get_session(a["phone"]), phone=a["phone"])
+            await asyncio.wait_for(c.connect(), timeout=15)
+            await asyncio.wait_for(c(JoinChannelRequest(channel_target)), timeout=20)
+            ok_join += 1
+        except Exception as e:
+            if any(w in str(e).lower() for w in ("already", "participant")):
+                ok_join += 1
+        finally:
+            if c:
+                try: await c.disconnect()
+                except Exception: pass
+        if idx % 5 == 0 or idx == len(accounts):
+            try:
+                await progress.edit_text(
+                    f"⏳ <b>[{channel_target}] مرحله ۱: عضویت</b>\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                    f"✅ {ok_join} / {idx} موفق",
+                    parse_mode="HTML",
+                )
+            except Exception:
+                pass
+        if idx < len(accounts):
+            await asyncio.sleep(random.uniform(2, 5))
+
+    # ── مرحله ۲: ری‌اکشن‌های مجاز + آخرین پست ──
+    await msg.answer(
+        f"⏳ <b>[{channel_target}] مرحله ۲: دریافت ری‌اکشن‌ها...</b>",
+        parse_mode="HTML",
+    )
+    allowed_reactions: list[str] = _DEFAULT_REACTIONS
+    last_msg_id: int | None = None
+    probe = None
+    try:
+        a = accounts[0]
+        probe = make_client(db.get_session(a["phone"]), phone=a["phone"])
+        await asyncio.wait_for(probe.connect(), timeout=15)
+        allowed_reactions = await _fetch_channel_reactions(probe, channel_target)
+        msgs_list = await asyncio.wait_for(probe.get_messages(channel_target, limit=1), timeout=15)
+        if msgs_list:
+            last_msg_id = msgs_list[0].id
+    except Exception as e:
+        db.debug_log("fixed_channel", "probe", "WARN", str(e))
+    finally:
+        if probe:
+            try: await probe.disconnect()
+            except Exception: pass
+
+    # ذخیره ری‌اکشن‌ها در لیست کانال‌ها
+    channels = _fch_load()
+    for ch in channels:
+        if ch["username"] == channel_target:
+            ch["reactions"] = allowed_reactions
+    _fch_save(channels)
+
+    reactions_text = "  ".join(allowed_reactions[:12])
+    await msg.answer(
+        f"✅ <b>ری‌اکشن‌های مجاز:</b>\n{reactions_text}",
+        parse_mode="HTML",
+    )
+
+    # ── مرحله ۳: ری‌اکشن روی آخرین پست ──
+    if last_msg_id:
+        rp = await msg.answer(
+            f"⏳ <b>[{channel_target}] مرحله ۳: ری‌اکشن (پست {last_msg_id})</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"0 / {len(accounts)} اکانت...",
+            parse_mode="HTML",
+        )
+        ok_react = 0
+        for idx, a in enumerate(accounts, 1):
+            c = None
+            try:
+                c = make_client(db.get_session(a["phone"]), phone=a["phone"])
+                await asyncio.wait_for(c.connect(), timeout=15)
+                await asyncio.wait_for(
+                    c(SendReactionRequest(
+                        peer=channel_target,
+                        msg_id=last_msg_id,
+                        reaction=[ReactionEmoji(emoticon=random.choice(allowed_reactions))],
+                    )),
+                    timeout=20,
+                )
+                ok_react += 1
+            except Exception as e:
+                db.debug_log("fixed_channel", "react", "WARN",
+                             f"{a['phone']}: {type(e).__name__}: {str(e)[:60]}")
+            finally:
+                if c:
+                    try: await c.disconnect()
+                    except Exception: pass
+            if idx % 5 == 0 or idx == len(accounts):
+                try:
+                    await rp.edit_text(
+                        f"⏳ <b>[{channel_target}] مرحله ۳: ری‌اکشن</b>\n"
+                        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                        f"✅ {ok_react} / {idx} انجام شد",
+                        parse_mode="HTML",
+                    )
+                except Exception:
+                    pass
+            if idx < len(accounts):
+                await asyncio.sleep(random.uniform(1, 3))
+
+    # ── مرحله ۴: listener دائمی ──
+    # هر کانال listener مستقل دارد؛ از global dict جلوگیری از تکرار
+    if channel_target not in _fch_active_listeners:
+        _fch_active_listeners.add(channel_target)
+        asyncio.create_task(_fixed_channel_listener(channel_target))
+
+    await msg.answer(
+        f"🎉 <b>اجرا برای <code>@{channel_target}</code> کامل شد</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"✅ جوین: <b>{ok_join}</b> اکانت\n"
+        f"💬 ری‌اکشن‌ها: {reactions_text}\n\n"
+        f"🔄 Listener فعال — هر پست جدید ری‌اکشن می‌گیره",
+        reply_markup=fixed_channels_list_menu(_fch_load()),
+        parse_mode="HTML",
+    )
+
+
+# ─────────────────────────────────────────────────────────
+# 📌 کانال‌های ثابت — listener دائمی
+# ─────────────────────────────────────────────────────────
+
+_fch_active_listeners: set[str] = set()   # کانال‌هایی که listener دارند
+
+
+async def _fixed_channel_listener(channel_target: str):
+    """
+    Listener دائمی برای یک کانال:
+    - هر ۶۰ ثانیه پست جدید چک می‌کند
+    - با همه اکانت‌ها ری‌اکشن تصادفی می‌زند
+    - اگر کانال از لیست حذف شد، متوقف می‌شود
+    """
+    import random
+    from core.engine import make_client
+    from telethon.tl.functions.messages import SendReactionRequest
+    from telethon.tl.types import ReactionEmoji
+
+    log.info(f"[fch_listener:{channel_target}] شروع")
+    seen_ids: set[int] = set()
+    poll_interval = 60
+
+    # مقداردهی اولیه seen_ids با پست‌های موجود
+    accounts = db.get_all_accounts()
+    probe = None
+    try:
+        a = accounts[0]
+        probe = make_client(db.get_session(a["phone"]), phone=a["phone"])
+        await asyncio.wait_for(probe.connect(), timeout=15)
+        old = await asyncio.wait_for(probe.get_messages(channel_target, limit=5), timeout=15)
+        for m in old:
+            seen_ids.add(m.id)
+    except Exception as e:
+        log.warning(f"[fch_listener:{channel_target}] init error: {e}")
+    finally:
+        if probe:
+            try: await probe.disconnect()
+            except Exception: pass
+
+    while True:
+        await asyncio.sleep(poll_interval)
+
+        # بررسی وجود کانال در لیست (اگه حذف شد متوقف می‌شه)
+        channels = _fch_load()
+        ch_data = next((c for c in channels if c["username"] == channel_target), None)
+        if not ch_data:
+            log.info(f"[fch_listener:{channel_target}] کانال از لیست حذف شد — listener متوقف")
+            _fch_active_listeners.discard(channel_target)
+            break
+
+        allowed_reactions = ch_data.get("reactions") or _DEFAULT_REACTIONS
+
+        # دریافت پست‌های جدید
+        new_msg_ids: list[int] = []
+        probe = None
+        current_accounts = db.get_all_accounts()
+        if not current_accounts:
+            continue
+        try:
+            a = current_accounts[0]
+            probe = make_client(db.get_session(a["phone"]), phone=a["phone"])
+            await asyncio.wait_for(probe.connect(), timeout=15)
+            recent = await asyncio.wait_for(probe.get_messages(channel_target, limit=5), timeout=15)
+            for m in recent:
+                if m.id not in seen_ids:
+                    new_msg_ids.append(m.id)
+                    seen_ids.add(m.id)
+        except Exception as e:
+            log.warning(f"[fch_listener:{channel_target}] poll error: {e}")
+        finally:
+            if probe:
+                try: await probe.disconnect()
+                except Exception: pass
+
+        # ری‌اکشن روی پست‌های جدید
+        for mid in new_msg_ids:
+            log.info(f"[fch_listener:{channel_target}] پست جدید {mid} — ری‌اکشن")
+            for a in current_accounts:
+                c = None
+                try:
+                    c = make_client(db.get_session(a["phone"]), phone=a["phone"])
+                    await asyncio.wait_for(c.connect(), timeout=15)
+                    await asyncio.wait_for(
+                        c(SendReactionRequest(
+                            peer=channel_target,
+                            msg_id=mid,
+                            reaction=[ReactionEmoji(emoticon=random.choice(allowed_reactions))],
+                        )),
+                        timeout=20,
+                    )
+                except Exception as e:
+                    log.debug(f"[fch_listener:{channel_target}] react {a['phone']}: {e}")
+                finally:
+                    if c:
+                        try: await c.disconnect()
+                        except Exception: pass
+                await asyncio.sleep(random.uniform(1, 4))
 
 
 # ─────────────────────────────────────────────────────────
@@ -1345,6 +1865,23 @@ async def cb_settings(cb: types.CallbackQuery, state: FSMContext):
             parse_mode="HTML",
         )
 
+    elif data == "viewguard":
+        from core.view_guard import VIEW_GUARD, MAX_VIEWS_PER_DAY, MIN_GAP_SEC, MAX_GAP_SEC
+        from bot.keyboards import viewguard_menu
+        stats = VIEW_GUARD.stats()
+        await cb.message.edit_text(
+            f"🔒 <b>تنظیمات ضد لیمیت (ViewGuard)</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"📊 ویوهای امروز (کل): <b>{stats['total_views_today']}</b>\n"
+            f"🚫 اکانت‌های flood: <b>{stats['flooded_now']}</b>\n"
+            f"💤 سهمیه تموم‌شده: <b>{stats['exhausted_today']}</b>\n\n"
+            f"⚙️ تنظیمات فعلی:\n"
+            f"  📅 سهمیه روزانه هر اکانت: <b>{MAX_VIEWS_PER_DAY}</b>\n"
+            f"  ⏳ فاصله بین ویو: <b>{MIN_GAP_SEC:.0f}-{MAX_GAP_SEC:.0f} ثانیه</b>\n\n"
+            f"👇 گزینه مورد نظر:",
+            reply_markup=viewguard_menu(),
+            parse_mode="HTML",
+        )
 
     try:
         await cb.answer()
@@ -2466,6 +3003,194 @@ async def _on_error(event: types.ErrorEvent):
     return True
 
 
+# ─────────────────────────────────────────────────────────
+# ViewGuard FSM states
+# ─────────────────────────────────────────────────────────
+from aiogram.fsm.state import State, StatesGroup
+
+class _VGState(StatesGroup):
+    waiting_daily_quota  = State()
+    waiting_gap          = State()
+    waiting_start_delay  = State()
+
+
+# ─────────────────────────────────────────────────────────
+# Callback: menu:settings (برگشت به تنظیمات)
+# ─────────────────────────────────────────────────────────
+@router.callback_query(F.data == "menu:settings")
+async def cb_back_settings(cb: types.CallbackQuery):
+    from bot.keyboards import settings_menu
+    from core.pool import POOL
+    mn = int(db.get_setting("shift_min_sec", Config.SHIFT_MIN_SEC)) // 60
+    mx = int(db.get_setting("shift_max_sec", Config.SHIFT_MAX_SEC)) // 60
+    try:
+        await cb.message.edit_text(
+            f"⚙️ <b>تنظیمات</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"⏱️ بازه شیفت: <b>{mn}-{mx} دقیقه</b>\n"
+            f"🔢 شیفت فعال: <b>{POOL.active_shift}</b>\n\n"
+            f"👇 گزینه مورد نظر:",
+            reply_markup=settings_menu(),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await cb.answer()
+
+
+# ─────────────────────────────────────────────────────────
+# Callback: vg:* (ViewGuard)
+# ─────────────────────────────────────────────────────────
+@router.callback_query(F.data.startswith("vg:"))
+async def cb_viewguard(cb: types.CallbackQuery, state: FSMContext):
+    from core.view_guard import VIEW_GUARD, MAX_VIEWS_PER_DAY, MIN_GAP_SEC, MAX_GAP_SEC
+    from bot.keyboards import viewguard_menu
+    action = cb.data.split(":")[1]
+
+    if action == "stats":
+        stats = VIEW_GUARD.stats()
+        pct   = int(stats["total_views_today"] / max(stats["total_accounts"] * MAX_VIEWS_PER_DAY, 1) * 100)
+        bar   = "▰" * min(pct // 10, 10) + "▱" * max(0, 10 - pct // 10)
+        await cb.answer(
+            f"📊 ویوی امروز: {stats['total_views_today']}\n"
+            f"{bar}\n"
+            f"🚫 flood: {stats['flooded_now']} | 💤 تموم: {stats['exhausted_today']}",
+            show_alert=True,
+        )
+
+    elif action == "reset":
+        # ریست state همه اکانت‌ها
+        from core.view_guard import _AccountState
+        for st in VIEW_GUARD._state.values():
+            st.views_today = 0
+            st.day_key     = ""
+        await cb.answer("✅ آمار ویو همه اکانت‌ها ریست شد", show_alert=True)
+        # آپدیت متن
+        stats = VIEW_GUARD.stats()
+        try:
+            await cb.message.edit_text(
+                f"🔒 <b>تنظیمات ضد لیمیت (ViewGuard)</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+                f"📊 ویوهای امروز (کل): <b>0</b>\n"
+                f"🚫 اکانت‌های flood: <b>{stats['flooded_now']}</b>\n"
+                f"💤 سهمیه تموم‌شده: <b>0</b>\n\n"
+                f"⚙️ تنظیمات فعلی:\n"
+                f"  📅 سهمیه روزانه هر اکانت: <b>{MAX_VIEWS_PER_DAY}</b>\n"
+                f"  ⏳ فاصله بین ویو: <b>{MIN_GAP_SEC:.0f}-{MAX_GAP_SEC:.0f} ثانیه</b>\n\n"
+                f"👇 گزینه مورد نظر:",
+                reply_markup=viewguard_menu(),
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+    elif action == "set_daily":
+        await cb.message.edit_text(
+            f"📅 <b>سهمیه روزانه ویو</b>\n\n"
+            f"فعلی: <b>{MAX_VIEWS_PER_DAY}</b> ویو در روز برای هر اکانت\n\n"
+            f"عدد جدید رو بفرست (مثال: <code>80</code>):",
+            reply_markup=cancel_menu(),
+            parse_mode="HTML",
+        )
+        await state.set_state(_VGState.waiting_daily_quota)
+        await cb.answer()
+        return
+
+    elif action == "set_gap":
+        from core.view_guard import MIN_GAP_SEC, MAX_GAP_SEC
+        await cb.message.edit_text(
+            f"⏳ <b>فاصله بین ویوها</b>\n\n"
+            f"فعلی: <b>{MIN_GAP_SEC:.0f}-{MAX_GAP_SEC:.0f} ثانیه</b>\n\n"
+            f"دو عدد بفرست (ثانیه): حداقل حداکثر\n"
+            f"مثال: <code>8 25</code>",
+            reply_markup=cancel_menu(),
+            parse_mode="HTML",
+        )
+        await state.set_state(_VGState.waiting_gap)
+        await cb.answer()
+        return
+
+    elif action == "set_start_delay":
+        cur_delay = float(db.get_setting("view_start_delay", 0) or 0)
+        await cb.message.edit_text(
+            f"⏰ <b>تاخیر شروع ویو</b>\n\n"
+            f"فعلی: <b>{cur_delay:.0f} ثانیه</b>\n\n"
+            "تعداد ثانیه تاخیر رو بفرست (صفر = بدون تاخیر):\n"
+            "مثال: <code>3</code>  یا  <code>0</code>",
+            reply_markup=cancel_menu(),
+            parse_mode="HTML",
+        )
+        await state.set_state(_VGState.waiting_start_delay)
+        await cb.answer()
+        return
+
+    try:
+        await cb.answer()
+    except Exception:
+        pass
+
+
+@router.message(StateFilter(_VGState.waiting_daily_quota))
+async def vg_set_daily(msg: types.Message, state: FSMContext):
+    if not await guard(msg): return
+    raw = (msg.text or "").strip().translate(_FA_DIGITS)
+    if not raw.isdigit() or int(raw) < 1:
+        await msg.answer("❌ عدد معتبر وارد کن (مثال: <code>80</code>)", parse_mode="HTML")
+        return
+    import core.view_guard as vg
+    vg.MAX_VIEWS_PER_DAY = int(raw)
+    db.set_setting("vg_max_views_per_day", int(raw))
+    await msg.answer(
+        f"✅ سهمیه روزانه تنظیم شد: <b>{raw} ویو</b> برای هر اکانت",
+        reply_markup=main_menu(), parse_mode="HTML",
+    )
+    await state.clear()
+
+
+@router.message(StateFilter(_VGState.waiting_gap))
+async def vg_set_gap(msg: types.Message, state: FSMContext):
+    if not await guard(msg): return
+    parts = (msg.text or "").strip().translate(_FA_DIGITS).split()
+    if len(parts) != 2 or not all(p.isdigit() for p in parts):
+        await msg.answer("❌ فرمت اشتباه. مثال: <code>8 25</code>", parse_mode="HTML")
+        return
+    mn, mx = int(parts[0]), int(parts[1])
+    if mn < 1 or mx <= mn:
+        await msg.answer("❌ حداقل باید کمتر از حداکثر باشه.", parse_mode="HTML")
+        return
+    import core.view_guard as vg
+    vg.MIN_GAP_SEC = float(mn)
+    vg.MAX_GAP_SEC = float(mx)
+    db.set_setting("vg_min_gap", mn)
+    db.set_setting("vg_max_gap", mx)
+    await msg.answer(
+        f"✅ فاصله ویو تنظیم شد: <b>{mn}-{mx} ثانیه</b>",
+        reply_markup=main_menu(), parse_mode="HTML",
+    )
+    await state.clear()
+
+
+@router.message(StateFilter(_VGState.waiting_start_delay))
+async def vg_set_start_delay(msg: types.Message, state: FSMContext):
+    if not await guard(msg): return
+    raw = (msg.text or "").strip().translate(_FA_DIGITS)
+    if not raw.isdigit():
+        await msg.answer("❌ عدد معتبر وارد کن (مثال: <code>3</code> یا <code>0</code>)", parse_mode="HTML")
+        return
+    seconds = int(raw)
+    if seconds < 0 or seconds > 300:
+        await msg.answer("❌ بین صفر تا ۳۰۰ ثانیه وارد کن.", parse_mode="HTML")
+        return
+    db.set_setting("view_start_delay", seconds)
+    if seconds == 0:
+        label = "بدون تاخیر (فوری)"
+    else:
+        label = f"{seconds} ثانیه"
+    await msg.answer(
+        f"✅ تاخیر شروع ویو تنظیم شد: <b>{label}</b>",
+        reply_markup=main_menu(), parse_mode="HTML",
+    )
+    await state.clear()
 
 
 # ═══════════════════════════════════════════════════════════════

@@ -10,6 +10,7 @@ from models import database as db
 from core.engine import instant_view
 from core.pool import POOL
 from core.entity import resolve_group_entity
+from core.view_guard import VIEW_GUARD
 
 from telethon.errors import FloodWaitError
 
@@ -181,6 +182,14 @@ class MultiTargetListener:
                     pass
 
     async def _view_one(self, phone, msg_id):
+        # ── ViewGuard: اجازه می‌گیریم قبل از هر کاری ──
+        ok, wait = VIEW_GUARD.can_view(phone, msg_id)
+        if not ok:
+            if wait == -1:
+                return ("SKIP", phone)       # سهمیه تموم یا تکراری
+            # نیاز به صبر داره — توی این round skip میشه
+            return ("WAIT", phone)
+
         # Lock per phone
         lock = _PHONE_LOCKS.get(phone)
         if lock is None:
@@ -211,8 +220,10 @@ class MultiTargetListener:
                 except Exception as e:
                     return (f"V:{type(e).__name__}", phone)
                 if r.get("ok"):
+                    VIEW_GUARD.on_view_ok(phone, msg_id)   # ✅ ثبت ویو موفق
                     return ("OK", phone)
                 elif "flood" in r:
+                    VIEW_GUARD.on_flood(phone, r["flood"]) # ⏳ cooldown
                     u = (datetime.utcnow() + timedelta(seconds=r["flood"])).isoformat()
                     db.update_account_status(phone, "flood", r["error"], u)
                     return (f"FLOOD:{r['flood']}", phone)
@@ -225,24 +236,43 @@ class MultiTargetListener:
         if not phones:
             return
 
-        eligible = list(phones)
-        skipped  = 0
+        # ── فقط اکانت‌هایی که ViewGuard اجازه میده ──
+        eligible = VIEW_GUARD.eligible_phones(phones, msg_id)
+        skipped  = len(phones) - len(eligible)
+
+        if not eligible:
+            db.debug_log("listener", "view_done", "SKIP",
+                         f"ID={msg_id} | w{wid} | همه skip (سهمیه/تکرار/flood)")
+            return
 
         random.shuffle(eligible)
         n = len(eligible)
+
+        # پنجره زمانی طبیعی: هر اکانت با فاصله کافی از قبلی
+        # به جای پخش یکنواخت، از توزیع نامنظم استفاده میکنیم
+        window = random.uniform(
+            max(n * 0.3, 3.0),   # حداقل ۳ ثانیه یا ۳۰۰ms/اکانت
+            max(n * 0.8, 8.0)    # حداکثر ۸ ثانیه یا ۸۰۰ms/اکانت
+        )
         t0 = _time.time()
 
-        # همه اکانت‌ها همزمان شروع می‌کنن — بدون delay پخش‌شده
-        # timeout هر اکانت 15s، timeout کل batch = 30s ثابت
-        BATCH_TIMEOUT = 30
+        async def one(phone, delay):
+            if delay > 0:
+                await asyncio.sleep(delay)
+            return await self._view_one(phone, msg_id)
 
-        tasks = [asyncio.create_task(self._view_one(phone, msg_id))
-                 for phone in eligible]
+        tasks = []
+        for i, phone in enumerate(eligible):
+            # توزیع نامنظم‌تر: بعضی اکانت‌ها زودتر، بعضی دیرتر
+            base = (i / max(n, 1)) * window
+            jitter = random.gauss(0, window * 0.08)  # نویز گاوسی
+            d = max(0.0, base + jitter)
+            tasks.append(asyncio.create_task(one(phone, d)))
 
         try:
             results = await asyncio.wait_for(
                 asyncio.gather(*tasks, return_exceptions=True),
-                timeout=BATCH_TIMEOUT)
+                timeout=window + 15)
         except asyncio.TimeoutError:
             results = []
             for t in tasks:
@@ -259,9 +289,11 @@ class MultiTargetListener:
                     suc += 1
         elapsed = _time.time() - t0
         summary = " | ".join(f"{k}={v}" for k, v in reasons.most_common(5))
+        guard_st = VIEW_GUARD.stats()
         db.debug_log("listener", "view_done", "RESULT",
                      f"ID={msg_id} | w{wid} | {suc}/{n} | skip:{skipped} | "
-                     f"{elapsed:.1f}s | {summary}")
+                     f"{elapsed:.1f}s | {summary} | "
+                     f"flood:{guard_st['flooded_now']} exhaust:{guard_st['exhausted_today']}")
 
     async def stop(self):
         self.is_running = False
@@ -303,12 +335,12 @@ async def ensure_group_listener():
 class GroupListener:
     """هر پیام جدید گروه/کانال رو با همه‌ی اکانت‌های شیفت فعال ویو می‌کنه و/یا می‌خونه."""
 
-    MAX_GROUP_MSG_AGE  = 300   # ثانیه — پیام‌های قدیمی‌تر skip می‌شن (۵ دقیقه، برای ساعت شلوغ)
+    MAX_GROUP_MSG_AGE  = 60    # ثانیه — پیام‌های قدیمی‌تر skip می‌شن
     MAX_GROUP_QUEUE    = 50
     POLL_INTERVAL      = 1.5   # ثانیه بین هر poll
     BAD_PHONE_COOLDOWN = 300   # اکانتی که نتونست گروه رو بخونه تا ۵ دقیقه کنار می‌ره
     SETTINGS_EVERY     = 10    # هر چند ثانیه تنظیمات از دیتابیس دوباره خونده بشه
-    MAX_CATCHUP        = 1200  # پیامی که تا ۲۰ دقیقه پیش اومده و جا مونده، هنوز پردازش میشه
+    MAX_CATCHUP        = 600   # پیامی که تا ۱۰ دقیقه پیش اومده و جا مونده، هنوز پردازش میشه
     POLL_FAIL_LIMIT    = 3     # چند poll ناموفق پشت هم تا خواننده عوض بشه
 
     def __init__(self, num_workers: int = 4):
@@ -424,23 +456,10 @@ class GroupListener:
 
     # ───────────────── ensure client ─────────────────
     async def _pick_client(self):
-        """اولین اکانت سالمی که قبلاً نشکسته و flood/error/dead نیست؛ اول وصل‌ها."""
+        """اولین اکانت سالمی که قبلاً نشکسته؛ اول اونایی که همین الان وصلن."""
         now = _time.time()
-        # اکانت‌های flood/error/dead از DB بخون تا لیسنر روشون وصل نشه
-        try:
-            bad_statuses = {
-                r["phone"] for r in db.get_all_accounts()
-                if r.get("status") in ("flood", "error", "dead")
-            }
-        except Exception:
-            bad_statuses = set()
-
-        cands = [
-            p for p in POOL.all_phones
-            if p not in POOL.blacklist
-            and self._bad.get(p, 0) < now
-            and p not in bad_statuses
-        ]
+        cands = [p for p in POOL.all_phones
+                 if p not in POOL.blacklist and self._bad.get(p, 0) < now]
         cands.sort(key=lambda p: 0 if POOL._is_live(p) else 1)
         for phone in cands[:15]:
             c = await POOL.get(phone)

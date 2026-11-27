@@ -80,15 +80,14 @@ def migrate_shifts():
 
 
 def set_status_bulk(phones: list, status: str, only_from=("online", "idle")):
-    """وضعیت چند اکانت رو با چند درخواست دسته‌ای عوض می‌کنه، بدون دست‌زدن به flood/error/dead."""
+    """وضعیت چند اکانت رو با چند درخواست دسته‌ای عوض می‌کنه، بدون دست‌زدن به flood/error."""
     if not phones:
         return
     sb = _get_client()
-    allowed = [s for s in only_from if s != "dead"]   # dead هیچوقت منبع نیست
     for i in range(0, len(phones), 100):
         chunk = phones[i:i + 100]
         sb.table("accounts").update({"status": status}) \
-          .in_("phone", chunk).in_("status", allowed).execute()
+          .in_("phone", chunk).in_("status", list(only_from)).execute()
 
 
 # ── Settings helpers ──────────────────────────────────────────
@@ -166,8 +165,7 @@ get_target_group_id = get_target_group      # سازگاری با کدهای ق�
 # ── Account helpers ───────────────────────────────────────────
 def add_account(phone: str, ss: str, pp: int | None = None) -> int:
     sb = _get_client()
-    # فقط اکانت‌های زنده رو بشمار (dead حساب نشه)
-    count_res = sb.table("accounts").select("id", count="exact").neq("status", "dead").execute()
+    count_res = sb.table("accounts").select("id", count="exact").execute()
     count = count_res.count or 0
     # تعداد شیفت‌ها رو از db بخون (پیش‌فرض ۴)
     try:
@@ -195,29 +193,15 @@ def get_account(phone: str) -> dict | None:
 
 
 def get_all_accounts() -> list[dict]:
-    """فقط اکانت‌های زنده (غیر dead) برمی‌گرده."""
     sb = _get_client()
-    res = (
-        sb.table("accounts")
-        .select("*")
-        .neq("status", "dead")
-        .order("id")
-        .execute()
-    )
-    # اکانت‌های بدون session رو هم بیرون نگه‌دار
+    res = sb.table("accounts").select("*").order("id").execute()
+    # اکانت‌های بدون session رو حذف کن — نه بلاک‌لیست، فقط از pool بیرون نگه‌دار
     return [r for r in res.data if r.get("session_encrypted")]
 
 
 def get_accounts_by_shift(s: str) -> list[dict]:
-    """فقط اکانت‌های زنده‌ی یک شیفت."""
     sb = _get_client()
-    res = (
-        sb.table("accounts")
-        .select("*")
-        .eq("shift", s)
-        .neq("status", "dead")
-        .execute()
-    )
+    res = sb.table("accounts").select("*").eq("shift", s).execute()
     return res.data
 
 
@@ -249,14 +233,8 @@ def delete_account(phone: str):
 
 
 def count_by_status() -> dict:
-    """تعداد اکانت‌ها به تفکیک وضعیت — اکانت‌های dead حساب نمیشن."""
     sb = _get_client()
-    res = (
-        sb.table("accounts")
-        .select("status")
-        .neq("status", "dead")
-        .execute()
-    )
+    res = sb.table("accounts").select("status").execute()
     counts: dict = {}
     for row in res.data:
         s = row["status"]

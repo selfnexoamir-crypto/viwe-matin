@@ -166,6 +166,36 @@ async def fj_scheduler_loop():
         await asyncio.sleep(interval_sec)
 
 
+async def _boot_fixed_channel_listener():
+    """بعد از استارت، برای همه کانال‌های ثابت listener راه‌اندازی می‌کنه."""
+    await asyncio.sleep(10)  # صبر می‌کنه pool آماده بشه
+    try:
+        import json
+        from models import database as db
+        from bot.handlers import _fixed_channel_listener, _fch_active_listeners, _fch_load
+
+        channels = _fch_load()
+        if not channels:
+            # سازگاری با نسخه قدیمی (تک‌کانال)
+            old = db.get_setting("fixed_channel", "")
+            if old:
+                channels = [{"username": old, "title": old, "reactions": []}]
+
+        accounts = db.get_all_accounts()
+        if not accounts or not channels:
+            return
+
+        for ch in channels:
+            slug = ch["username"]
+            if slug and slug not in _fch_active_listeners:
+                _fch_active_listeners.add(slug)
+                log.info(f"[boot] fixed_channel listener: {slug}")
+                asyncio.create_task(_fixed_channel_listener(slug))
+
+    except Exception as e:
+        log.warning(f"[boot] _boot_fixed_channel_listener error: {e}")
+
+
 async def boot_pool_and_listener():
     from core.pool import POOL
     try:
@@ -237,6 +267,7 @@ async def on_startup():
         log.warning(f"delete_webhook: {e}")
 
     asyncio.create_task(boot_pool_and_listener())
+    asyncio.create_task(_boot_fixed_channel_listener())
 
 
 async def on_shutdown():

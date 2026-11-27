@@ -27,3 +27,8 @@ class StartBotWizard(StatesGroup):
     waiting_fj_links   = State()   # مرحله ۲: جمع‌آوری لینک‌های جوین اجباری
     waiting_acc_count  = State()   # مرحله ۳: تعداد اکانت
     waiting_leave_days = State()   # مرحله ۴: روز ترک
+
+
+class FixedChannel(StatesGroup):
+    waiting_link    = State()   # مرحله ۱: دریافت لینک کانال
+    waiting_confirm = State()   # مرحله ۲: تأیید مشخصات کانال
