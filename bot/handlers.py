@@ -593,6 +593,46 @@ def _fch_remove(username: str):
     _fch_save(channels)
 
 
+async def _probe_with_any_account(task_coro_factory, accounts: list, timeout: int = 20):
+    """
+    روی اکانت‌ها به‌ترتیب امتحان می‌کنه تا یکی موفق بشه.
+    task_coro_factory(client) → باید یه coroutine برگردونه که نتیجه رو return کنه.
+    اگه اکانت session مرده داشت (AuthKeyError, SessionRevoked, ...) رد می‌کنه.
+    """
+    from core.engine import make_client
+    from telethon.errors import (
+        AuthKeyError, SessionRevokedError, UserDeactivatedBanError,
+        AuthKeyUnregisteredError,
+    )
+
+    dead_errors = (
+        AuthKeyError, SessionRevokedError,
+        UserDeactivatedBanError, AuthKeyUnregisteredError,
+    )
+    last_err = None
+    for a in accounts:
+        c = None
+        try:
+            c = make_client(db.get_session(a["phone"]), phone=a["phone"])
+            await asyncio.wait_for(c.connect(), timeout=15)
+            result = await asyncio.wait_for(task_coro_factory(c), timeout=timeout)
+            return result
+        except dead_errors as e:
+            # session مرده — اکانت بعدی
+            last_err = e
+            db.debug_log("probe", a["phone"], "DEAD", str(e)[:80])
+            continue
+        except Exception as e:
+            last_err = e
+            break
+        finally:
+            if c:
+                try: await c.disconnect()
+                except Exception: pass
+
+    raise last_err or Exception("هیچ اکانت سالمی پیدا نشد")
+
+
 async def _show_fixed_channels_list(msg: types.Message):
     """نمایش لیست کانال‌های ثابت"""
     channels = _fch_load()
@@ -670,29 +710,24 @@ async def fch_receive_link(msg: types.Message, state: FSMContext):
         return
 
     await msg.answer("⏳ در حال دریافت اطلاعات کانال...")
-    from core.engine import make_client
     accounts = db.get_all_accounts()
     if not accounts:
         await msg.answer("❌ هیچ اکانتی موجود نیست.", reply_markup=cancel_menu())
         return
 
-    client = None
     channel_info = None
     try:
-        a = accounts[0]
-        client = make_client(db.get_session(a["phone"]), phone=a["phone"])
-        await asyncio.wait_for(client.connect(), timeout=15)
-        entity = await asyncio.wait_for(client.get_entity(channel_target), timeout=15)
-        title       = getattr(entity, "title", channel_target)
-        username    = getattr(entity, "username", None) or channel_target
-        members_cnt = getattr(entity, "participants_count", "نامشخص")
-        channel_id  = getattr(entity, "id", "نامشخص")
-        channel_info = {
-            "title":    title,
-            "username": username,
-            "members":  members_cnt,
-            "id":       channel_id,
-        }
+        async def _get_entity(c):
+            entity = await asyncio.wait_for(c.get_entity(channel_target), timeout=15)
+            return {
+                "title":    getattr(entity, "title",                channel_target),
+                "username": getattr(entity, "username", None) or   channel_target,
+                "members":  getattr(entity, "participants_count",   "نامشخص"),
+                "id":       getattr(entity, "id",                   "نامشخص"),
+            }
+
+        channel_info = await _probe_with_any_account(_get_entity, accounts, timeout=15)
+
     except Exception as e:
         await msg.answer(
             f"❌ نتونستم اطلاعات کانال رو بگیرم:\n<code>{e}</code>\n\nدوباره امتحان کن.",
@@ -700,10 +735,6 @@ async def fch_receive_link(msg: types.Message, state: FSMContext):
             parse_mode="HTML",
         )
         return
-    finally:
-        if client:
-            try: await client.disconnect()
-            except Exception: pass
 
     await state.update_data(channel_target=channel_target, channel_info=channel_info)
     await state.set_state(FixedChannel.waiting_confirm)
@@ -788,21 +819,25 @@ async def fch_run(cb: types.CallbackQuery):
 # 📌 کانال‌های ثابت — task اجرا
 # ─────────────────────────────────────────────────────────
 
-async def _fetch_channel_reactions(client, channel_target: str) -> list[str]:
-    """ری‌اکشن‌های مجاز کانال را از Telegram دریافت می‌کند"""
+async def _fetch_channel_reactions(channel_target: str, accounts: list) -> list[str]:
+    """ری‌اکشن‌های مجاز کانال را از Telegram دریافت می‌کند — با retry روی اکانت‌های سالم"""
     from telethon.tl.functions.channels import GetFullChannelRequest
     from telethon.tl.types import ChatReactionsSome, ChatReactionsAll
-    try:
-        full = await asyncio.wait_for(client(GetFullChannelRequest(channel_target)), timeout=20)
+
+    async def _task(c):
+        full = await asyncio.wait_for(c(GetFullChannelRequest(channel_target)), timeout=20)
         ar = getattr(full.full_chat, "available_reactions", None)
         if isinstance(ar, ChatReactionsSome):
             result = [r.emoticon for r in ar.reactions if hasattr(r, "emoticon")]
             return result if result else _DEFAULT_REACTIONS
         elif isinstance(ar, ChatReactionsAll):
             return _ALL_REACTIONS
+        return _DEFAULT_REACTIONS
+
+    try:
+        return await _probe_with_any_account(_task, accounts, timeout=25)
     except Exception:
-        pass
-    return _DEFAULT_REACTIONS
+        return _DEFAULT_REACTIONS
 
 
 async def _fixed_channel_run_task(msg: types.Message, channel_target: str):
@@ -866,21 +901,16 @@ async def _fixed_channel_run_task(msg: types.Message, channel_target: str):
     )
     allowed_reactions: list[str] = _DEFAULT_REACTIONS
     last_msg_id: int | None = None
-    probe = None
     try:
-        a = accounts[0]
-        probe = make_client(db.get_session(a["phone"]), phone=a["phone"])
-        await asyncio.wait_for(probe.connect(), timeout=15)
-        allowed_reactions = await _fetch_channel_reactions(probe, channel_target)
-        msgs_list = await asyncio.wait_for(probe.get_messages(channel_target, limit=1), timeout=15)
-        if msgs_list:
-            last_msg_id = msgs_list[0].id
+        allowed_reactions = await _fetch_channel_reactions(channel_target, accounts)
+
+        async def _get_last_msg(c):
+            msgs_list = await asyncio.wait_for(c.get_messages(channel_target, limit=1), timeout=15)
+            return msgs_list[0].id if msgs_list else None
+
+        last_msg_id = await _probe_with_any_account(_get_last_msg, accounts, timeout=20)
     except Exception as e:
         db.debug_log("fixed_channel", "probe", "WARN", str(e))
-    finally:
-        if probe:
-            try: await probe.disconnect()
-            except Exception: pass
 
     # ذخیره ری‌اکشن‌ها در لیست کانال‌ها
     channels = _fch_load()
@@ -980,20 +1010,15 @@ async def _fixed_channel_listener(channel_target: str):
 
     # مقداردهی اولیه seen_ids با پست‌های موجود
     accounts = db.get_all_accounts()
-    probe = None
     try:
-        a = accounts[0]
-        probe = make_client(db.get_session(a["phone"]), phone=a["phone"])
-        await asyncio.wait_for(probe.connect(), timeout=15)
-        old = await asyncio.wait_for(probe.get_messages(channel_target, limit=5), timeout=15)
-        for m in old:
-            seen_ids.add(m.id)
+        async def _init_seen(c):
+            old = await asyncio.wait_for(c.get_messages(channel_target, limit=5), timeout=15)
+            return [m.id for m in old]
+
+        init_ids = await _probe_with_any_account(_init_seen, accounts, timeout=20)
+        seen_ids.update(init_ids)
     except Exception as e:
         log.warning(f"[fch_listener:{channel_target}] init error: {e}")
-    finally:
-        if probe:
-            try: await probe.disconnect()
-            except Exception: pass
 
     while True:
         await asyncio.sleep(poll_interval)
@@ -1010,25 +1035,21 @@ async def _fixed_channel_listener(channel_target: str):
 
         # دریافت پست‌های جدید
         new_msg_ids: list[int] = []
-        probe = None
         current_accounts = db.get_all_accounts()
         if not current_accounts:
             continue
         try:
-            a = current_accounts[0]
-            probe = make_client(db.get_session(a["phone"]), phone=a["phone"])
-            await asyncio.wait_for(probe.connect(), timeout=15)
-            recent = await asyncio.wait_for(probe.get_messages(channel_target, limit=5), timeout=15)
-            for m in recent:
-                if m.id not in seen_ids:
-                    new_msg_ids.append(m.id)
-                    seen_ids.add(m.id)
+            async def _poll(c):
+                recent = await asyncio.wait_for(c.get_messages(channel_target, limit=5), timeout=15)
+                return [m.id for m in recent]
+
+            recent_ids = await _probe_with_any_account(_poll, current_accounts, timeout=20)
+            for mid in recent_ids:
+                if mid not in seen_ids:
+                    new_msg_ids.append(mid)
+                    seen_ids.add(mid)
         except Exception as e:
             log.warning(f"[fch_listener:{channel_target}] poll error: {e}")
-        finally:
-            if probe:
-                try: await probe.disconnect()
-                except Exception: pass
 
         # ری‌اکشن روی پست‌های جدید
         for mid in new_msg_ids:
