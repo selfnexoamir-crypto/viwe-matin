@@ -13,6 +13,7 @@ from core.entity import resolve_group_entity
 from core.view_guard import VIEW_GUARD
 
 from telethon.errors import FloodWaitError
+from core.tasks import spawn
 
 _VIEW_PAUSED = False
 _ENTITY_CACHE = {}
@@ -60,9 +61,9 @@ class MultiTargetListener:
             db.debug_log("listener", "scheduler", "ERROR", str(e))
 
         for i in range(self.num_workers):
-            w = asyncio.create_task(self._worker(i))
+            w = spawn(self._worker(i))
             self.workers.append(w)
-        self._warm_task = asyncio.create_task(self._warm_loop())
+        self._warm_task = spawn(self._warm_loop())
 
         while self.is_running:
             try:
@@ -267,7 +268,7 @@ class MultiTargetListener:
             base = (i / max(n, 1)) * window
             jitter = random.gauss(0, window * 0.08)  # نویز گاوسی
             d = max(0.0, base + jitter)
-            tasks.append(asyncio.create_task(one(phone, d)))
+            tasks.append(spawn(one(phone, d)))
 
         try:
             results = await asyncio.wait_for(
@@ -328,7 +329,7 @@ async def ensure_group_listener():
         return _CURRENT
     gl = GroupListener()
     _CURRENT = gl
-    _TASK = asyncio.create_task(gl.start())
+    _TASK = spawn(gl.start())
     return gl
 
 
@@ -408,8 +409,8 @@ class GroupListener:
             db.debug_log("group_listener", "scheduler", "ERROR", str(_se))
 
         for i in range(self.num_workers):
-            self.workers.append(asyncio.create_task(self._worker(i)))
-        self._warm_task = asyncio.create_task(self._warm_loop())
+            self.workers.append(spawn(self._worker(i)))
+        self._warm_task = spawn(self._warm_loop())
 
         while self.is_running:
             try:
@@ -665,7 +666,7 @@ class GroupListener:
             return await self._read_one(phone, msg_id)
 
         tasks = [
-            asyncio.create_task(one(phone, (i / max(n, 1)) * window + random.uniform(0, 0.15)))
+            spawn(one(phone, (i / max(n, 1)) * window + random.uniform(0, 0.15)))
             for i, phone in enumerate(phones)
         ]
         try:

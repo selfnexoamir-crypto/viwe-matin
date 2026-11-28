@@ -17,6 +17,7 @@ import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import Config
 from models import database as db
+from core.tasks import spawn
 from core.warp_pool import (
     POOL_DIR, get_all_configs, get_port_from_conf,
     generate_one, find_free_slot, _existing_keys,
@@ -141,7 +142,7 @@ class ProxyWatchdog:
         if len(healthy) < 30:
             needed = 30 - len(healthy)
             db.debug_log("watchdog", "regen", "INFO", f"نیاز به {needed} کانفیگ")
-            asyncio.create_task(self._generate_new(needed))
+            spawn(self._generate_new(needed))
 
         db.debug_log("watchdog", "cycle", "OK",
                      f"✅ {len(healthy)} سالم | {len(ACCOUNT_PROXY)} تخصیص")

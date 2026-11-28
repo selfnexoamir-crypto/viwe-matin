@@ -16,8 +16,58 @@ from config import Config
 from models import database as db
 
 
-def make_client(session_string, proxy=None, phone=None):
-    """ساخت کلاینت با proxy per-phone"""
+class _BorrowedClient:
+    """پروکسی روی کلاینت زنده‌ی pool.
+
+    اگه دو کلاینت با یه session همزمان وصل بشن تلگرام AuthKeyDuplicatedError میده و
+    session برای همیشه می‌میره. این wrapper کلاینت خود pool رو قرض می‌ده و
+    connect/disconnect رو بی‌اثر می‌کنه تا کد قدیمی (connect → کار → disconnect)
+    بدون دست‌زدن بهش امن بشه.
+    """
+    __slots__ = ("_c",)
+
+    def __init__(self, real):
+        object.__setattr__(self, "_c", real)
+
+    async def connect(self, *a, **kw):
+        return None
+
+    async def disconnect(self, *a, **kw):
+        return None
+
+    def __call__(self, *a, **kw):
+        return self._c(*a, **kw)
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+    def __setattr__(self, name, value):
+        setattr(self._c, name, value)
+
+
+def _pool_client(phone):
+    """کلاینت زنده‌ی pool برای این شماره (اگه باشه)."""
+    import sys as _sys
+    mod = _sys.modules.get("core.pool")
+    pool = getattr(mod, "POOL", None) if mod else None
+    if pool is None or not phone:
+        return None
+    c = pool.clients.get(phone)
+    try:
+        return c if (c is not None and c.is_connected()) else None
+    except Exception:
+        return None
+
+
+def make_client(session_string, proxy=None, phone=None, shared=True):
+    """ساخت کلاینت با proxy per-phone.
+
+    shared=True: اگه همین اکانت توی pool وصله، همون کلاینت قرض داده میشه (نه یه اتصال دوم).
+    pool خودش shared=False میده."""
+    if shared and phone and not proxy:
+        live = _pool_client(phone)
+        if live is not None:
+            return _BorrowedClient(live)
     client = TelegramClient(
         StringSession(session_string),
         Config.API_ID,

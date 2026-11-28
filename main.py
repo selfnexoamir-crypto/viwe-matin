@@ -12,6 +12,7 @@ from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
 from models import database as db
 from bot.handlers import register_handlers
+from core.tasks import spawn
 
 logging.basicConfig(
     level=getattr(logging, Config.LOG_LEVEL, logging.INFO),
@@ -61,28 +62,29 @@ async def fj_scheduler_loop():
 
     while True:
         try:
-            enabled      = db.get_setting("fj_enabled", "0") == "1"
-            interval_min = max(1, int(db.get_setting("fj_join_interval_min", "10")))
-            batch_size   = max(1, int(db.get_setting("fj_batch_size", "5")))
+            enabled      = await asyncio.to_thread(db.get_setting, "fj_enabled", "0") == "1"
+            interval_min = max(1, int(await asyncio.to_thread(db.get_setting, "fj_join_interval_min", "10")))
+            batch_size   = max(1, int(await asyncio.to_thread(db.get_setting, "fj_batch_size", "5")))
             interval_sec = interval_min * 60
 
             if not enabled:
                 await asyncio.sleep(30)
                 continue
 
-            group_id = db.get_target_group()
+            group_id = await asyncio.to_thread(db.get_target_group)
             if not group_id:
                 log.warning("fj_scheduler: گروه هدف تنظیم نشده")
                 await asyncio.sleep(interval_sec)
                 continue
 
-            accounts = db.get_all_accounts()
+            accounts = await asyncio.to_thread(db.get_all_accounts)
             active   = [a for a in accounts if a.get("status") != "dead"]
             if not active:
                 await asyncio.sleep(interval_sec)
                 continue
 
             # انتخاب batch چرخشی
+            batch_size = min(batch_size, len(active))      # بیشتر از تعداد اکانت‌ها → یه اکانت دو بار می‌اومد
             start = batch_index % len(active)
             batch = (active + active)[start: start + batch_size]
             batch_index = (start + batch_size) % len(active)
@@ -190,7 +192,7 @@ async def _boot_fixed_channel_listener():
             if slug and slug not in _fch_active_listeners:
                 _fch_active_listeners.add(slug)
                 log.info(f"[boot] fixed_channel listener: {slug}")
-                asyncio.create_task(_fixed_channel_listener(slug))
+                spawn(_fixed_channel_listener(slug))
 
     except Exception as e:
         log.warning(f"[boot] _boot_fixed_channel_listener error: {e}")
@@ -223,11 +225,11 @@ async def boot_pool_and_listener():
     else:
         log.warning("⚠️ گروه هدف تنظیم نشده — ویو غیرفعال")
 
-    t = asyncio.create_task(group_listener_watchdog())
+    t = spawn(group_listener_watchdog())
     _bg_tasks.add(t)
     t.add_done_callback(_bg_tasks.discard)
 
-    fj = asyncio.create_task(fj_scheduler_loop())
+    fj = spawn(fj_scheduler_loop())
     _bg_tasks.add(fj)
     fj.add_done_callback(_bg_tasks.discard)
 
@@ -256,8 +258,8 @@ async def on_startup():
             log.error(f"  config error: {e}")
         raise SystemExit(1)
 
-    db.init_db()
-    db.migrate_shifts()
+    await asyncio.to_thread(db.init_db)
+    await asyncio.to_thread(db.migrate_shifts)
     db.debug_log("main", "startup", "OK", f"{Config.BOT_NAME} [polling]")
 
     try:
@@ -266,8 +268,8 @@ async def on_startup():
     except Exception as e:
         log.warning(f"delete_webhook: {e}")
 
-    asyncio.create_task(boot_pool_and_listener())
-    asyncio.create_task(_boot_fixed_channel_listener())
+    spawn(boot_pool_and_listener())
+    spawn(_boot_fixed_channel_listener())
 
 
 async def on_shutdown():

@@ -48,7 +48,6 @@ class ClientPool:
                 return v
         except Exception:
             pass
-        from config import Config
         n = getattr(Config, "NUM_SHIFTS", 4)
         return max(1, min(n, 20))
 
@@ -150,7 +149,7 @@ class ClientPool:
             if not ss:
                 self.blacklist.add(phone)
                 raise RuntimeError("session خالیه")
-            client = make_client(ss, phone=phone)
+            client = make_client(ss, phone=phone, shared=False)
             await asyncio.wait_for(client.connect(), timeout=25)
             ok = await asyncio.wait_for(client.is_user_authorized(), timeout=10)
             if not ok:
@@ -270,31 +269,59 @@ class ClientPool:
             pass
 
     async def add_account_live(self, phone):
-        """اکانت تازه اضافه‌شده رو بر اساس شیفت دیتابیس وارد pool می‌کنه و وصلش می‌کنه."""
+        """اکانت تازه اضافه‌شده رو بر اساس شیفت دیتابیس وارد pool می‌کنه و وصلش می‌کنه.
+
+        اگه pool هنوز در حال init باشه (ready نشده)، تا ۱۸۰ ثانیه صبر می‌کنه.
+        در صورت timeout اکانت رو به shifts اضافه می‌کنه ولی drop نمی‌کنه.
+        """
+        # ─── صبر برای اتمام init — timeout رو بالا بردیم چون init با ۱۰۰+ اکانت
+        # ممکنه بیشتر از ۳۰ ثانیه طول بکشه
         try:
-            await asyncio.wait_for(self.ready.wait(), timeout=30)
+            await asyncio.wait_for(self.ready.wait(), timeout=180)
         except asyncio.TimeoutError:
-            pass
+            db.debug_log("pool", "add_account_live", "WARN",
+                         f"{phone}: ready timeout — ادامه بدون تضمین init کامل")
+
+        # ─── اطلاعات شیفت رو از DB بخون (نه از حافظه — ممکنه هنوز load نشده باشه)
         row = db.get_account(phone)
-        sh = int(str((row or {}).get("shift") or 1))
-        sh = sh if sh in self.shifts else 1
-        self.blacklist.discard(phone)
-        if phone not in self.all_phones:
-            self.all_phones.append(phone)
-        for v in self.shifts.values():
-            if phone in v:
-                v.remove(phone)
-        self.shifts[sh].append(phone)
+        sh_raw = str((row or {}).get("shift") or "1")
+        try:
+            sh = int(sh_raw)
+        except ValueError:
+            sh = 1
+        # اگه shifts هنوز ساخته نشده یا sh خارج از محدوده‌ست → به شیفت ۱ بزن
+        if not self.shifts or sh not in self.shifts:
+            sh = 1
+            if self.shifts and 1 not in self.shifts:
+                sh = next(iter(self.shifts))
+
+        async with self.lock:
+            self.blacklist.discard(phone)
+            if phone not in self.all_phones:
+                self.all_phones.append(phone)
+            # از همه buckets حذف کن — جلوگیری از duplicate
+            for v in self.shifts.values():
+                if phone in v:
+                    v.remove(phone)
+            # bucket مقصد رو بساز اگه وجود نداره
+            if sh not in self.shifts:
+                self.shifts[sh] = []
+            self.shifts[sh].append(phone)
+
+        # ─── اتصال — force=True تا retry_after رو نادیده بگیره
         client = await self._connect_one(phone, force=True)
 
-        # ─── FIX Bug 1: فقط وقتی شیفت اکانت جدید == شیفت فعال باشه sync کن
-        # وگرنه sync_status همین اکانت رو idle می‌کنه چون توی شیفت فعال نیست
+        # ─── اگه اولین تلاش fail شد یه retry بعد از ۵ ثانیه
+        if client is None:
+            await asyncio.sleep(5)
+            client = await self._connect_one(phone, force=True)
+
         is_in_active = (
             self.active_shift == 0
             or sh == self.active_shift
         )
+
         if is_in_active:
-            # اکانت باید online باشه — مستقیم ست کن بدون sync کامل
             if client is not None and client.is_connected():
                 try:
                     db.set_status_bulk([phone], "online")
@@ -302,11 +329,15 @@ class ClientPool:
                     pass
             await asyncio.to_thread(self._safe_sync)
         else:
-            # شیفت غیرفعال — بدون تغییر وضعیت اکانت‌های online فعلی
+            # شیفت غیرفعال — فقط وضعیت همین اکانت رو idle کن
             try:
                 db.update_account_status(phone, "idle", None)
             except Exception:
                 pass
+
+        db.debug_log("pool", "add_account_live", "OK" if client else "WARN",
+                     f"{phone} shift={sh} active_shift={self.active_shift} "
+                     f"connected={client is not None and client.is_connected()}")
         return client
 
     async def drop(self, phone):

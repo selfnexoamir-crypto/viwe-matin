@@ -162,18 +162,39 @@ def get_target_group():
 get_target_group_id = get_target_group      # سازگاری با کدهای قبلی
 
 
+def _fetch_all(table: str, columns: str = "*", order: str | None = None, page: int = 1000) -> list[dict]:
+    """همه ردیف‌ها — Supabase پیش‌فرض فقط ۱۰۰۰ ردیف برمی‌گردونه."""
+    sb = _get_client()
+    out: list[dict] = []
+    start = 0
+    while True:
+        q = sb.table(table).select(columns)
+        if order:
+            q = q.order(order)
+        rows = q.range(start, start + page - 1).execute().data or []
+        out.extend(rows)
+        if len(rows) < page:
+            return out
+        start += page
+
+
 # ── Account helpers ───────────────────────────────────────────
 def add_account(phone: str, ss: str, pp: int | None = None) -> int:
     sb = _get_client()
-    count_res = sb.table("accounts").select("id", count="exact").execute()
-    count = count_res.count or 0
-    # تعداد شیفت‌ها رو از db بخون (پیش‌فرض ۴)
     try:
         _ns = int(get_setting("num_shifts", 4) or 4)
         _ns = max(1, min(_ns, 20))
     except Exception:
         _ns = 4
-    shift = str((count % _ns) + 1)
+
+    # اکانت جدید میره توی کم‌جمعیت‌ترین شیفت (با حذف/اضافه شدن‌ها هم متعادل می‌مونه؛
+    # فرمول count % n بعد از حذف اکانت شیفت‌ها رو نامتعادل می‌کرد)
+    loads = {str(i): 0 for i in range(1, _ns + 1)}
+    for r in _fetch_all("accounts", "shift"):
+        k = str(r.get("shift") or "")
+        if k in loads:
+            loads[k] += 1
+    shift = min(loads, key=lambda k: (loads[k], int(k)))
     res = sb.table("accounts").insert({
         "phone":             phone,
         "session_encrypted": encrypt(ss),
@@ -182,7 +203,7 @@ def add_account(phone: str, ss: str, pp: int | None = None) -> int:
         "status":            "idle",
     }).execute()
     new_id = res.data[0]["id"]
-    print(f"✅ اکانت {phone} اضافه شد → شیفت {shift} (شماره {count + 1})", flush=True)
+    print(f"✅ اکانت {phone} اضافه شد → شیفت {shift} ({loads})", flush=True)
     return new_id
 
 
@@ -193,10 +214,8 @@ def get_account(phone: str) -> dict | None:
 
 
 def get_all_accounts() -> list[dict]:
-    sb = _get_client()
-    res = sb.table("accounts").select("*").order("id").execute()
     # اکانت‌های بدون session رو حذف کن — نه بلاک‌لیست، فقط از pool بیرون نگه‌دار
-    return [r for r in res.data if r.get("session_encrypted")]
+    return [r for r in _fetch_all("accounts", "*", order="id") if r.get("session_encrypted")]
 
 
 def get_accounts_by_shift(s: str) -> list[dict]:
@@ -233,10 +252,8 @@ def delete_account(phone: str):
 
 
 def count_by_status() -> dict:
-    sb = _get_client()
-    res = sb.table("accounts").select("status").execute()
     counts: dict = {}
-    for row in res.data:
+    for row in _fetch_all("accounts", "status"):
         s = row["status"]
         counts[s] = counts.get(s, 0) + 1
     return counts

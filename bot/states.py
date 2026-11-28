@@ -20,6 +20,7 @@ class SetGroup(StatesGroup):
 class UseMembers(StatesGroup):
     waiting_start_bot_link  = State()
     waiting_join_group_link = State()
+    waiting_join_count      = State()   # تعداد اکانت برای عضو شدن
 
 
 class StartBotWizard(StatesGroup):
