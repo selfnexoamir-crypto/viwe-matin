@@ -24,7 +24,31 @@ def use_members_menu() -> InlineKeyboardMarkup:
     b.button(text="👥 عضو شدن توی گروه",     callback_data="mem:join_group")
     b.button(text="🔗 جوین توی جوین اجباری", callback_data="mem:forced_join")
     b.button(text="📌 ثبت کانال ثابت",       callback_data="mem:fixed_channel")
+    b.button(text="🔄 فالیت در گروه‌ها",     callback_data="mem:forward_relay")
     b.button(text="🔙 برگشت",                callback_data="menu:main")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def forward_relay_menu(running: bool) -> InlineKeyboardMarkup:
+    """منوی فالیت در گروه‌ها"""
+    b = InlineKeyboardBuilder()
+    if running:
+        b.button(text="⏹ خاموش کردن فالیت",  callback_data="fwd:stop")
+    else:
+        b.button(text="▶️ روشن کردن فالیت",   callback_data="fwd:start")
+    b.button(text="⚙️ تنظیمات فالیت",         callback_data="fwd:settings")
+    b.button(text="📊 آمار لحظه‌ای",          callback_data="fwd:stats")
+    b.button(text="🔙 برگشت",                 callback_data="mem:back")
+    b.adjust(1)
+    return b.as_markup()
+
+
+def forward_relay_settings_menu(delay: int) -> InlineKeyboardMarkup:
+    """منوی تنظیمات فالیت"""
+    b = InlineKeyboardBuilder()
+    b.button(text=f"⏱ تاخیر بین فوروارد: {delay} ثانیه", callback_data="fwd:set_delay")
+    b.button(text="🔙 برگشت",                              callback_data="fwd:menu")
     b.adjust(1)
     return b.as_markup()
 
@@ -123,18 +147,6 @@ def status_menu() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def accounts_menu() -> InlineKeyboardMarkup:
-    b = InlineKeyboardBuilder()
-    b.button(text="📋 لیست کامل",    callback_data="acc:list:0")
-    b.button(text="➕ افزودن جدید",  callback_data="acc:add")
-    b.button(text="🔄 چرخش فوری",   callback_data="acc:rotate")
-    b.button(text="🧹 حذف flood‌ها", callback_data="acc:cleanup")
-    b.button(text="📥 بکاپ الان",    callback_data="acc:backup")
-    b.button(text="🔙 برگشت",        callback_data="menu:main")
-    b.adjust(2)
-    return b.as_markup()
-
-
 def accounts_list_kb(accounts: list, page: int = 0, per_page: int = 10) -> InlineKeyboardMarkup:
     b   = InlineKeyboardBuilder()
     s   = page * per_page
@@ -220,12 +232,19 @@ def viewguard_menu() -> InlineKeyboardMarkup:
     return b.as_markup()
 
 
-def group_menu() -> InlineKeyboardMarkup:
+def group_menu(group2=None) -> InlineKeyboardMarkup:
+    """group2: ref گروه دوم (str/int) یا None — برای نمایش وضعیت دکمه."""
     b = InlineKeyboardBuilder()
-    b.button(text="✏️ تنظیم آیدی گروه",       callback_data="grp:set")
+    b.button(text="✏️ تنظیم گروه اول",         callback_data="grp:set")
+    if group2:
+        b.button(text=f"✏️ گروه دوم: {group2 if isinstance(group2, str) else str(group2)[:18]}",
+                 callback_data="grp:set2")
+        b.button(text="🗑 حذف گروه دوم",        callback_data="grp:del2")
+    else:
+        b.button(text="➕ افزودن گروه دوم",     callback_data="grp:set2")
     b.button(text="👥 عضویت همه اکانت‌ها",    callback_data="grp:join")
     b.button(text="📊 چک عضویت‌ها",            callback_data="grp:check")
-    b.button(text="🆔 نمایش گروه فعلی",        callback_data="grp:info")
+    b.button(text="🆔 نمایش گروه‌های فعلی",   callback_data="grp:info")
     b.button(text="🩺 تشخیص ویو",              callback_data="grp:diag")
     b.button(text="🧪 تست روی آخرین پیام",     callback_data="grp:test")
     b.button(text="🔁 نوع عملیات (ویو/خواندن)", callback_data="grp:mode")
@@ -281,6 +300,31 @@ def shift_select_menu(current: int, num_shifts: int = 0) -> InlineKeyboardMarkup
     b.button(text=f"{all_mark}🌐 همه شیفت‌ها", callback_data="shift:select:0")
     b.button(text="🔙 برگشت", callback_data="menu:main")
     b.adjust(2)
+    return b.as_markup()
+
+
+def accounts_menu() -> InlineKeyboardMarkup:
+    b = InlineKeyboardBuilder()
+    b.button(text="📋 لیست کامل",         callback_data="acc:list:0")
+    b.button(text="➕ افزودن جدید",        callback_data="acc:add")
+    b.button(text="🔄 چرخش فوری",          callback_data="acc:rotate")
+    b.button(text="🧹 حذف flood‌ها",       callback_data="acc:cleanup")
+    b.button(text="📥 بکاپ الان",          callback_data="acc:backup")
+    b.button(text="✏️ تغییر مشخصات اکانت‌ها", callback_data="ep:menu")
+    b.button(text="🔙 برگشت",             callback_data="menu:main")
+    b.adjust(2)
+    return b.as_markup()
+
+
+def edit_profiles_menu() -> InlineKeyboardMarkup:
+    """منوی تغییر مشخصات اکانت‌ها"""
+    b = InlineKeyboardBuilder()
+    b.button(text="📝 نام اکانت‌ها",        callback_data="ep:names")
+    b.button(text="📄 بیو اکانت‌ها",        callback_data="ep:bios")
+    b.button(text="🔑 یوزرنیم اکانت‌ها",   callback_data="ep:usernames")
+    b.button(text="🖼 عکس پروفایل اکانت‌ها", callback_data="ep:photos")
+    b.button(text="🔙 برگشت",              callback_data="menu:accounts")
+    b.adjust(1)
     return b.as_markup()
 
 

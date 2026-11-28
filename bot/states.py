@@ -17,6 +17,10 @@ class SetGroup(StatesGroup):
     waiting_id = State()
 
 
+class SetGroup2(StatesGroup):
+    waiting_id = State()
+
+
 class UseMembers(StatesGroup):
     waiting_start_bot_link  = State()
     waiting_join_group_link = State()
@@ -33,3 +37,11 @@ class StartBotWizard(StatesGroup):
 class FixedChannel(StatesGroup):
     waiting_link    = State()   # مرحله ۱: دریافت لینک کانال
     waiting_confirm = State()   # مرحله ۲: تأیید مشخصات کانال
+
+
+class EditProfiles(StatesGroup):
+    waiting_names       = State()   # دریافت لیست اسم‌ها (با _ جدا)
+    waiting_bios        = State()   # دریافت لیست بیوها (با _ جدا)
+    waiting_usernames   = State()   # دریافت لیست یوزرنیم‌ها (با _ جدا)
+    waiting_photos_zip  = State()   # دریافت فایل زیپ عکس‌های پروفایل
+    waiting_group_photos_zip = State()  # دریافت فایل زیپ عکس‌های پروفایل گروه‌ها

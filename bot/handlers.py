@@ -34,8 +34,11 @@ from bot.keyboards import (
     add_method_menu, smart_scheduler_menu,
     fixed_channel_confirm_menu, fixed_channel_actions_menu,
     fixed_channels_list_menu,
+    edit_profiles_menu,
+    forward_relay_menu,
+    forward_relay_settings_menu,
 )
-from bot.states import AddAccount, SetShiftTiming, SetGroup, UseMembers, StartBotWizard, FixedChannel
+from bot.states import AddAccount, SetShiftTiming, SetGroup, SetGroup2, UseMembers, StartBotWizard, FixedChannel, EditProfiles
 from core.tasks import spawn
 
 router = Router()
@@ -100,6 +103,16 @@ def _normalize_phone(raw: str) -> str | None:
 def _get_group_id():
     """یوزرنیم (str) یا آیدی عددی (int) یا 0"""
     return db.get_target_group()
+
+
+def _get_group2():
+    """گروه دوم — str/int یا None"""
+    return db.get_target_group2()
+
+
+def _make_group_menu():
+    """منوی گروه با وضعیت گروه دوم"""
+    return group_menu(group2=_get_group2())
 
 
 # ─────────────────────────────────────────────────────────
@@ -271,12 +284,15 @@ async def show_stats(msg: types.Message):
 async def show_group(msg: types.Message):
     if not await guard(msg): return
     group_id = _get_group_id()
+    group2   = _get_group2()
+    g2_line  = f"\n🆔 گروه دوم: <code>{db.fmt_group(group2)}</code>" if group2 else "\n➕ گروه دوم: تنظیم نشده"
     await msg.answer(
-        f"🎯 <b>گروه هدف</b>\n"
+        f"🎯 <b>گروه‌های هدف</b>\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
-        f"🆔 آیدی: <code>{db.fmt_group(group_id)}</code>\n\n"
+        f"🆔 گروه اول: <code>{db.fmt_group(group_id)}</code>"
+        f"{g2_line}\n\n"
         f"👇 گزینه مورد نظر:",
-        reply_markup=group_menu(),
+        reply_markup=_make_group_menu(),
         parse_mode="HTML",
     )
 
@@ -346,6 +362,88 @@ async def set_group_id(msg: types.Message, state: FSMContext):
     await state.clear()
 
 
+# ─────────────────────────────────────────────────────────
+# ➕ گروه دوم — تنظیم
+# ─────────────────────────────────────────────────────────
+@router.callback_query(F.data == "grp:set2")
+async def cb_group_set2(cb: types.CallbackQuery, state: FSMContext):
+    if not await guard(cb): return
+    cur = _get_group2()
+    cur_line = f"\n🆔 گروه دوم فعلی: <code>{db.fmt_group(cur)}</code>" if cur else ""
+    await cb.message.edit_text(
+        f"🎯 <b>تنظیم گروه دوم</b>{cur_line}\n\n"
+        "یوزرنیم یا لینک گروه دوم رو بفرست:\n"
+        "<code>@mygroup2</code>\n"
+        "<code>https://t.me/mygroup2</code>\n\n"
+        "⚠️ اکانت‌ها باید عضو این گروه هم باشن.",
+        parse_mode="HTML",
+    )
+    await state.set_state(SetGroup2.waiting_id)
+    await cb.answer()
+
+
+@router.message(StateFilter(SetGroup2.waiting_id))
+async def set_group2_id(msg: types.Message, state: FSMContext):
+    if not await guard(msg): return
+    raw = (msg.text or "").strip()
+    ref = db.parse_group_ref(raw)
+    if not ref:
+        await msg.answer(
+            "❌ فرمت اشتباه. مثال: <code>@mygroup</code> یا <code>-1001234567890</code>",
+            parse_mode="HTML")
+        return
+
+    primary = _get_group_id()
+    if ref == primary:
+        await msg.answer("❌ گروه دوم نمی‌تونه همون گروه اول باشه.", parse_mode="HTML")
+        return
+
+    db.set_target_group2(ref)
+    text = f"✅ گروه دوم تنظیم شد!\n🆔 <code>{db.fmt_group(ref)}</code>\n"
+
+    try:
+        from core.pool import POOL
+        from core.entity import resolve_group_entity
+        from telethon.tl.types import User
+        client = next((c for c in POOL.clients.values() if c.is_connected()), None)
+        if client is None:
+            text += "\n⚠️ هنوز اکانتی وصل نیست، تأیید نشد."
+        else:
+            ent = await resolve_group_entity(client, ref, timeout=15)
+            if isinstance(ent, User):
+                text += "\n⚠️ این یوزرنیم مال یه <b>کاربره</b>، نه گروه!"
+            else:
+                text += f"\n🔎 تأیید شد: <b>{getattr(ent, 'title', '?')}</b>"
+                text += "\n💡 اکانت‌ها باید عضو گروه دوم هم باشن."
+    except Exception as e:
+        text += f"\n⚠️ ذخیره شد ولی گروه پیدا نشد:\n<code>{str(e)[:150]}</code>"
+
+    try:
+        from core.listener import ensure_group_listener
+        gl = await ensure_group_listener()
+        gl._settings_ts = 0.0
+        text += "\n\n✅ لیسنر آپدیت شد — گروه دوم رو برمی‌داره."
+    except Exception as e:
+        text += f"\n\n⚠️ لیسنر آپدیت نشد: <code>{str(e)[:100]}</code>"
+
+    await msg.answer(text, reply_markup=main_menu(), parse_mode="HTML")
+    await state.clear()
+
+
+@router.callback_query(F.data == "grp:del2")
+async def cb_group_del2(cb: types.CallbackQuery):
+    if not await guard(cb): return
+    db.set_target_group2(None)
+    try:
+        from core.listener import ensure_group_listener
+        gl = await ensure_group_listener()
+        gl._settings_ts = 0.0
+    except Exception:
+        pass
+    await cb.answer("🗑 گروه دوم حذف شد.", show_alert=True)
+    await cb.message.edit_reply_markup(reply_markup=_make_group_menu())
+
+
 @router.callback_query(F.data.startswith("grp:"))
 async def cb_group(cb: types.CallbackQuery):
     data     = cb.data.split(":")[1]
@@ -360,7 +458,11 @@ async def cb_group(cb: types.CallbackQuery):
         spawn(_check_group_join_task(cb, group_id))
 
     elif data == "info":
-        await cb.answer(f"🎯 گروه: {db.fmt_group(group_id)}", show_alert=True)
+        group2 = _get_group2()
+        info = f"🎯 گروه ۱: {db.fmt_group(group_id)}"
+        if group2:
+            info += f"\n🎯 گروه ۲: {db.fmt_group(group2)}"
+        await cb.answer(info, show_alert=True)
 
     elif data == "diag":
         await cb.answer()
@@ -3806,6 +3908,1045 @@ async def _sbw_run_task(
         result += f"\n... و {len(errors) - 5} خطای دیگه"
 
     await msg.answer(result, reply_markup=main_menu(), parse_mode="HTML")
+
+
+# ═══════════════════════════════════════════════════════════════
+# 🔄 فالیت در گروه‌ها  (fwd:)
+# ═══════════════════════════════════════════════════════════════
+#
+# منطق:
+#   گروه ۱  ──فوروارد──▶  گروه ۲
+#   گروه ۲  ──فوروارد──▶  گروه ۱
+#
+# هر بار یک اکانت یک پیام فوروارد می‌کنه.
+# بعد از اینکه همه اکانت‌ها یک نوبت زدن، از اول شروع می‌شه.
+# اگه ربات جوین اجباری اکانت رو تگ کنه، اکانت عضو کانال‌ها میشه
+# و پیامش رو دوباره فوروارد می‌کنه.
+# ═══════════════════════════════════════════════════════════════
+
+import asyncio as _asyncio
+
+# ── وضعیت گلوبال (در حافظه) ──────────────────────────────────
+_fwd_task: "_asyncio.Task | None" = None      # task در حال اجرا
+_fwd_stats: dict = {
+    "forwarded": 0,       # کل فوروارد موفق
+    "retried":   0,       # کل دوباره‌تلاش‌ها (بعد از جوین اجباری)
+    "errors":    0,       # خطاهای کلی
+    "round":     0,       # شماره دور فعلی
+}
+
+
+def _fwd_running() -> bool:
+    return _fwd_task is not None and not _fwd_task.done()
+
+
+# ── State برای تنظیم تاخیر ───────────────────────────────────
+from aiogram.fsm.state import State, StatesGroup as _SG2
+
+class _FwdState(_SG2):
+    waiting_delay = State()
+
+
+# ── Callback ورودی از منو ────────────────────────────────────
+
+@router.callback_query(F.data == "mem:forward_relay")
+async def cb_fwd_menu(cb: types.CallbackQuery):
+    if not await guard(cb.message): return
+    g1 = _get_group_id()
+    g2 = _get_group2()
+    await cb.message.edit_text(
+        _fwd_status_text(g1, g2),
+        reply_markup=forward_relay_menu(_fwd_running()),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+
+@router.callback_query(F.data == "fwd:menu")
+async def cb_fwd_back_menu(cb: types.CallbackQuery):
+    g1 = _get_group_id()
+    g2 = _get_group2()
+    try:
+        await cb.message.edit_text(
+            _fwd_status_text(g1, g2),
+            reply_markup=forward_relay_menu(_fwd_running()),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await cb.answer()
+
+
+def _fwd_status_text(g1, g2) -> str:
+    delay = int(db.get_setting("fwd_delay_sec", "5"))
+    status = "🟢 روشن" if _fwd_running() else "🔴 خاموش"
+    g1_txt = str(g1) if g1 else "❌ تنظیم نشده"
+    g2_txt = str(g2) if g2 else "❌ تنظیم نشده"
+    return (
+        "🔄 <b>فالیت در گروه‌ها</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"وضعیت: <b>{status}</b>\n"
+        f"⏱ تاخیر بین هر فوروارد: <b>{delay} ثانیه</b>\n\n"
+        f"📌 مسیر فوروارد:\n"
+        f"  🔵 گروه ۱: <code>{g1_txt}</code>\n"
+        f"     ↕️\n"
+        f"  🟢 گروه ۲: <code>{g2_txt}</code>\n\n"
+        f"📊 آمار این سشن:\n"
+        f"  ✅ فوروارد موفق: <b>{_fwd_stats['forwarded']}</b>\n"
+        f"  🔁 دور: <b>{_fwd_stats['round']}</b>\n"
+        f"  ❌ خطا: <b>{_fwd_stats['errors']}</b>"
+    )
+
+
+@router.callback_query(F.data == "fwd:stats")
+async def cb_fwd_stats(cb: types.CallbackQuery):
+    g1 = _get_group_id()
+    g2 = _get_group2()
+    try:
+        await cb.message.edit_text(
+            _fwd_status_text(g1, g2),
+            reply_markup=forward_relay_menu(_fwd_running()),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await cb.answer()
+
+
+# ── روشن/خاموش ───────────────────────────────────────────────
+
+@router.callback_query(F.data == "fwd:start")
+async def cb_fwd_start(cb: types.CallbackQuery):
+    global _fwd_task, _fwd_stats
+    if not await guard(cb.message): return
+
+    g1 = _get_group_id()
+    g2 = _get_group2()
+
+    if not g1 or not g2:
+        await cb.answer(
+            "❌ باید هر دو گروه (گروه ۱ و گروه ۲) تنظیم باشن!\n"
+            "از منوی 🎯 گروه هدف اضافه کن.",
+            show_alert=True,
+        )
+        return
+
+    if _fwd_running():
+        await cb.answer("⚠️ فالیت قبلاً روشنه!", show_alert=True)
+        return
+
+    # ریست آمار
+    _fwd_stats = {"forwarded": 0, "retried": 0, "errors": 0, "round": 0}
+
+    _fwd_task = _asyncio.get_event_loop().create_task(
+        _fwd_relay_loop(cb.message.chat.id, cb.bot, g1, g2)
+    )
+
+    await cb.answer("▶️ فالیت روشن شد!", show_alert=True)
+    try:
+        await cb.message.edit_text(
+            _fwd_status_text(g1, g2),
+            reply_markup=forward_relay_menu(True),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+@router.callback_query(F.data == "fwd:stop")
+async def cb_fwd_stop(cb: types.CallbackQuery):
+    global _fwd_task
+    if _fwd_task and not _fwd_task.done():
+        _fwd_task.cancel()
+        try:
+            await _fwd_task
+        except _asyncio.CancelledError:
+            pass
+    _fwd_task = None
+
+    g1 = _get_group_id()
+    g2 = _get_group2()
+    await cb.answer("⏹ فالیت خاموش شد.", show_alert=True)
+    try:
+        await cb.message.edit_text(
+            _fwd_status_text(g1, g2),
+            reply_markup=forward_relay_menu(False),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+
+
+# ── تنظیمات ──────────────────────────────────────────────────
+
+@router.callback_query(F.data == "fwd:settings")
+async def cb_fwd_settings(cb: types.CallbackQuery):
+    delay = int(db.get_setting("fwd_delay_sec", "5"))
+    try:
+        await cb.message.edit_text(
+            "⚙️ <b>تنظیمات فالیت</b>\n"
+            "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"⏱ تاخیر فعلی بین هر فوروارد: <b>{delay} ثانیه</b>\n\n"
+            "👇 گزینه مورد نظر:",
+            reply_markup=forward_relay_settings_menu(delay),
+            parse_mode="HTML",
+        )
+    except Exception:
+        pass
+    await cb.answer()
+
+
+@router.callback_query(F.data == "fwd:set_delay")
+async def cb_fwd_set_delay(cb: types.CallbackQuery, state: FSMContext):
+    cur = int(db.get_setting("fwd_delay_sec", "5"))
+    await cb.message.answer(
+        f"⏱ <b>تاخیر بین هر فوروارد (ثانیه)</b>\n\n"
+        f"مقدار فعلی: <b>{cur} ثانیه</b>\n\n"
+        f"عدد ثانیه رو بفرست. مثال: <code>5</code>",
+        reply_markup=cancel_menu(),
+        parse_mode="HTML",
+    )
+    await state.set_state(_FwdState.waiting_delay)
+    await cb.answer()
+
+
+@router.message(StateFilter(_FwdState.waiting_delay))
+async def fwd_receive_delay(msg: types.Message, state: FSMContext):
+    if not await guard(msg): return
+    raw = (msg.text or "").strip().translate(_FA_DIGITS)
+    if not raw.isdigit() or int(raw) < 1:
+        await msg.answer("❌ عدد معتبر وارد کن (حداقل ۱ ثانیه). مثال: <code>5</code>", parse_mode="HTML")
+        return
+    db.set_setting("fwd_delay_sec", raw)
+    await state.clear()
+    await msg.answer(
+        f"✅ تاخیر تنظیم شد: <b>{raw} ثانیه</b>",
+        reply_markup=main_menu(), parse_mode="HTML",
+    )
+
+
+# ── حلقه اصلی فوروارد ────────────────────────────────────────
+
+async def _fwd_relay_loop(admin_chat_id: int, bot: "Bot", g1, g2):
+    """
+    حلقه بی‌نهایت:
+    - هر دور همه اکانت‌ها یک بار فوروارد می‌کنن
+    - مبدأ/مقصد در هر دور عوض می‌شه (۱→۲ یا ۲→۱)
+    - اگه ربات جوین اجباری پیام بده، اکانت عضو کانال‌ها میشه و retry می‌کنه
+    """
+    global _fwd_stats
+
+    from core.engine import make_client
+    from core.entity import resolve_group_entity
+    from telethon.tl.functions.channels import JoinChannelRequest
+
+    round_num = 0
+
+    while True:
+        accounts = db.get_all_accounts()
+        if not accounts:
+            await _asyncio.sleep(10)
+            continue
+
+        round_num += 1
+        _fwd_stats["round"] = round_num
+
+        # در دورهای فرد: ۱→۲ ،  در دورهای زوج: ۲→۱
+        if round_num % 2 == 1:
+            src_group, dst_group = g1, g2
+            dir_label = "گروه ۱ ➜ گروه ۲"
+        else:
+            src_group, dst_group = g2, g1
+            dir_label = "گروه ۲ ➜ گروه ۱"
+
+        # اطلاع‌رسانی شروع دور
+        try:
+            await bot.send_message(
+                admin_chat_id,
+                f"🔄 <b>دور {round_num} شروع شد</b>\n"
+                f"📌 جهت: {dir_label}\n"
+                f"👥 تعداد اکانت: {len(accounts)}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+        for acc in accounts:
+            # چک: آیا task کنسل شده؟
+            await _asyncio.sleep(0)
+
+            delay = int(db.get_setting("fwd_delay_sec", "5"))
+            phone = acc["phone"]
+            client = None
+
+            try:
+                client = make_client(db.get_session(phone), phone=phone)
+                await _asyncio.wait_for(client.connect(), timeout=20)
+
+                if not await client.is_user_authorized():
+                    _fwd_stats["errors"] += 1
+                    continue
+
+                # ───── مرحله ۱: فوروارد از مبدأ به مقصد ─────
+                success = await _fwd_one_account(
+                    client, acc, src_group, dst_group, bot, admin_chat_id
+                )
+
+                if success:
+                    _fwd_stats["forwarded"] += 1
+                else:
+                    _fwd_stats["errors"] += 1
+
+            except _asyncio.CancelledError:
+                raise
+            except Exception as e:
+                _fwd_stats["errors"] += 1
+                log.warning(f"[fwd] {phone}: {e}")
+            finally:
+                if client:
+                    try:
+                        await client.disconnect()
+                    except Exception:
+                        pass
+
+            # تاخیر بین هر اکانت
+            await _asyncio.sleep(delay)
+
+        # پایان دور
+        try:
+            await bot.send_message(
+                admin_chat_id,
+                f"✅ <b>دور {round_num} تموم شد</b>\n"
+                f"✅ فوروارد موفق این دور: دیده می‌شه در آمار\n"
+                f"📊 کل موفق: {_fwd_stats['forwarded']} | خطا: {_fwd_stats['errors']}",
+                parse_mode="HTML",
+            )
+        except Exception:
+            pass
+
+        # کمی صبر بین دورها
+        await _asyncio.sleep(2)
+
+
+async def _fwd_one_account(client, acc, src_group, dst_group, bot, admin_chat_id: int) -> bool:
+    """
+    یک اکانت:
+    ۱. آخرین پیام رو از src_group فوروارد می‌کنه به dst_group
+    ۲. اگه ربات جوین اجباری اکانت رو تگ کرد → عضو کانال‌ها میشه → retry
+    برگشت: True اگه موفق
+    """
+    from core.entity import resolve_group_entity
+    from telethon.tl.functions.channels import JoinChannelRequest
+    import re as _re
+
+    phone = acc["phone"]
+    MAX_RETRY = 2
+
+    for attempt in range(1, MAX_RETRY + 1):
+        try:
+            src_entity = await resolve_group_entity(client, src_group, timeout=15)
+            dst_entity = await resolve_group_entity(client, dst_group, timeout=15)
+
+            # آخرین پیام معمولی (نه سیستمی) از مبدأ
+            src_msg = None
+            async for m in client.iter_messages(src_entity, limit=20):
+                if m.text or m.media:
+                    src_msg = m
+                    break
+
+            if src_msg is None:
+                log.warning(f"[fwd] {phone}: no message in source group")
+                return False
+
+            # فوروارد
+            await client.forward_messages(dst_entity, src_msg)
+
+            # ───── چک جوین اجباری ─────
+            # کمی صبر کن ببین ربات پیامی داد یا نه
+            await _asyncio.sleep(3)
+
+            bot_msg = await _fwd_detect_forced_join(client, dst_entity, phone)
+
+            if bot_msg:
+                # ربات جوین اجباری پیام داد → عضو کانال‌ها شو
+                joined = await _fwd_join_channels_from_msg(client, bot_msg)
+                _fwd_stats["retried"] += 1
+                log.info(f"[fwd] {phone}: joined {len(joined)} channels, retrying forward")
+
+                if attempt < MAX_RETRY:
+                    await _asyncio.sleep(3)
+                    continue   # retry
+                else:
+                    # آخرین تلاش: دوباره فوروارد بزن
+                    await _asyncio.sleep(2)
+                    await client.forward_messages(dst_entity, src_msg)
+                    return True
+
+            return True
+
+        except _asyncio.CancelledError:
+            raise
+        except Exception as e:
+            log.warning(f"[fwd] {phone} attempt {attempt}: {e}")
+            if attempt == MAX_RETRY:
+                return False
+            await _asyncio.sleep(3)
+
+    return False
+
+
+async def _fwd_detect_forced_join(client, group_entity, phone: str):
+    """
+    دنبال پیام ربات جوین اجباری می‌گرده.
+    معیار: پیام جدید (< 10 ثانیه) که کاربر رو تگ کرده و دکمه اینلاین داره.
+    برگشت: پیام ربات یا None
+    """
+    import time
+
+    me = await client.get_me()
+    my_id = me.id
+    now = time.time()
+
+    async for msg in client.iter_messages(group_entity, limit=15):
+        # پیام باید جدید باشه (کمتر از ۱۵ ثانیه)
+        msg_time = msg.date.timestamp() if msg.date else 0
+        if now - msg_time > 15:
+            break
+
+        # باید دکمه اینلاین داشته باشه
+        if not msg.buttons:
+            continue
+
+        # باید کاربر رو تگ کرده باشه (mention)
+        raw = msg.raw_text or ""
+        if f"@{phone}" in raw or str(my_id) in raw:
+            return msg
+
+        # برخی ربات‌ها با entities تگ می‌کنن
+        if msg.entities:
+            for ent in msg.entities:
+                ent_type = type(ent).__name__
+                if "MentionName" in ent_type or "Mention" in ent_type:
+                    user_id = getattr(ent, "user_id", None)
+                    if user_id == my_id:
+                        return msg
+
+    return None
+
+
+async def _fwd_join_channels_from_msg(client, bot_msg) -> list:
+    """از دکمه‌های اینلاین پیام ربات، کانال‌ها رو استخراج و جوین می‌کنه."""
+    from telethon.tl.functions.channels import JoinChannelRequest
+
+    joined = []
+    if not bot_msg.buttons:
+        return joined
+
+    for row in bot_msg.buttons:
+        for btn in row:
+            url = getattr(btn, "url", None)
+            if not url:
+                continue
+            if "t.me" not in url and "telegram.me" not in url:
+                continue
+            try:
+                entity = await client.get_entity(url)
+                await client(JoinChannelRequest(entity))
+                joined.append(url)
+                await _asyncio.sleep(2)
+            except _asyncio.CancelledError:
+                raise
+            except Exception as je:
+                log.warning(f"[fwd] join channel {url}: {je}")
+
+    return joined
+
+
+# ═══════════════════════════════════════════════════════════════
+# ✏️ تغییر مشخصات اکانت‌ها  (ep:)
+# ═══════════════════════════════════════════════════════════════
+
+@router.callback_query(F.data == "ep:menu")
+async def cb_ep_menu(cb: types.CallbackQuery):
+    """نمایش منوی تغییر مشخصات"""
+    if not await guard(cb.message): return
+    await cb.message.edit_text(
+        "✏️ <b>تغییر مشخصات اکانت‌ها</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        "یک گزینه رو انتخاب کن:",
+        reply_markup=edit_profiles_menu(),
+        parse_mode="HTML",
+    )
+    await cb.answer()
+
+
+# ── نام اکانت‌ها ──────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "ep:names")
+async def cb_ep_names(cb: types.CallbackQuery, state: FSMContext):
+    if not await guard(cb.message): return
+    total = len(db.get_all_accounts())
+    await cb.message.edit_text(
+        "📝 <b>تغییر نام اکانت‌ها</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 تعداد اکانت‌ها: <b>{total}</b>\n\n"
+        f"لطفاً <b>{total}</b> نام مختلف رو در یک پیام بفرست.\n"
+        "فرمت (با _ از هم جدا کن):\n"
+        "<code>علی_حسین_مهدی_رضا_سارا_...</code>\n\n"
+        "⚠️ هر نام برای یک اکانت جداست.\n"
+        "⚠️ اگه کمتر از تعداد اکانت بفرستی، بقیه تغییر نمی‌کنن.",
+        parse_mode="HTML",
+    )
+    await state.set_state(EditProfiles.waiting_names)
+    await cb.answer()
+
+
+@router.message(StateFilter(EditProfiles.waiting_names))
+async def ep_receive_names(msg: types.Message, state: FSMContext):
+    if not await guard(msg): return
+    raw = msg.text.strip() if msg.text else ""
+    if not raw:
+        await msg.answer("❌ پیام خالی بود. دوباره بفرست یا /cancel بزن.")
+        return
+
+    names = [n.strip() for n in raw.split("_") if n.strip()]
+    accounts = db.get_all_accounts()
+    total = len(accounts)
+
+    if not names:
+        await msg.answer("❌ هیچ نامی یافت نشد. دقت کن با _ جدا باشن.")
+        return
+
+    progress_msg = await msg.answer(
+        f"⏳ در حال تغییر نام‌ها...\n0 / {min(len(names), total)} اکانت",
+        parse_mode="HTML",
+    )
+
+    import random
+    ok, fail = 0, 0
+    errors = []
+
+    for idx, (acc, name) in enumerate(zip(accounts, names), 1):
+        c = None
+        try:
+            from core.engine import make_client
+            from telethon.tl.functions.account import UpdateProfileRequest as EditProfileRequest
+            c = await make_client(acc)
+            await c.connect()
+            # تقسیم نام به first و last
+            parts = name.split(" ", 1)
+            first = parts[0]
+            last = parts[1] if len(parts) > 1 else ""
+            await c(EditProfileRequest(first_name=first, last_name=last))
+            ok += 1
+        except Exception as e:
+            fail += 1
+            errors.append(f"📱 {acc['phone']}: {str(e)[:60]}")
+        finally:
+            if c:
+                try: await c.disconnect()
+                except: pass
+
+        if idx % 5 == 0 or idx == min(len(names), total):
+            try:
+                await progress_msg.edit_text(
+                    f"⏳ تغییر نام‌ها...\n✅ {ok} موفق | ❌ {fail} خطا | {idx}/{min(len(names), total)}",
+                )
+            except: pass
+        await asyncio.sleep(random.uniform(1.5, 3.5))
+
+    result = (
+        "✅ <b>تغییر نام‌ها تموم شد</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"✅ موفق: <b>{ok}</b>\n"
+        f"❌ خطا: <b>{fail}</b>\n"
+        f"⏭ تعداد نام‌های اضافی (استفاده‌نشده): <b>{max(0, len(names) - total)}</b>"
+    )
+    for e in errors[:5]:
+        result += f"\n🔴 <code>{e}</code>"
+    if len(errors) > 5:
+        result += f"\n... و {len(errors) - 5} خطای دیگه"
+
+    await state.clear()
+    await msg.answer(result, reply_markup=accounts_menu(), parse_mode="HTML")
+
+
+# ── بیو اکانت‌ها ──────────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "ep:bios")
+async def cb_ep_bios(cb: types.CallbackQuery, state: FSMContext):
+    if not await guard(cb.message): return
+    total = len(db.get_all_accounts())
+    await cb.message.edit_text(
+        "📄 <b>تغییر بیو اکانت‌ها</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 تعداد اکانت‌ها: <b>{total}</b>\n\n"
+        f"لطفاً <b>{total}</b> بیوی مختلف رو در یک پیام بفرست.\n"
+        "فرمت (با _ از هم جدا کن):\n"
+        "<code>عزیزم اسمون روشنه_خوابم میاد_عشقم مادرمه_...</code>\n\n"
+        "⚠️ هر بیو برای یک اکانت جداست.\n"
+        "⚠️ اگه کمتر از تعداد اکانت بفرستی، بقیه تغییر نمی‌کنن.",
+        parse_mode="HTML",
+    )
+    await state.set_state(EditProfiles.waiting_bios)
+    await cb.answer()
+
+
+@router.message(StateFilter(EditProfiles.waiting_bios))
+async def ep_receive_bios(msg: types.Message, state: FSMContext):
+    if not await guard(msg): return
+    raw = msg.text.strip() if msg.text else ""
+    if not raw:
+        await msg.answer("❌ پیام خالی بود. دوباره بفرست یا /cancel بزن.")
+        return
+
+    bios = [b.strip() for b in raw.split("_") if b.strip()]
+    accounts = db.get_all_accounts()
+    total = len(accounts)
+
+    if not bios:
+        await msg.answer("❌ هیچ بیویی یافت نشد. دقت کن با _ جدا باشن.")
+        return
+
+    progress_msg = await msg.answer(
+        f"⏳ در حال تغییر بیوها...\n0 / {min(len(bios), total)} اکانت",
+    )
+
+    import random
+    ok, fail = 0, 0
+    errors = []
+
+    for idx, (acc, bio) in enumerate(zip(accounts, bios), 1):
+        c = None
+        try:
+            from core.engine import make_client
+            from telethon.tl.functions.account import UpdateProfileRequest as EditProfileRequest
+            c = await make_client(acc)
+            await c.connect()
+            await c(EditProfileRequest(about=bio))
+            ok += 1
+        except Exception as e:
+            fail += 1
+            errors.append(f"📱 {acc['phone']}: {str(e)[:60]}")
+        finally:
+            if c:
+                try: await c.disconnect()
+                except: pass
+
+        if idx % 5 == 0 or idx == min(len(bios), total):
+            try:
+                await progress_msg.edit_text(
+                    f"⏳ تغییر بیوها...\n✅ {ok} موفق | ❌ {fail} خطا | {idx}/{min(len(bios), total)}",
+                )
+            except: pass
+        await asyncio.sleep(random.uniform(1.5, 3.5))
+
+    result = (
+        "✅ <b>تغییر بیوها تموم شد</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"✅ موفق: <b>{ok}</b>\n"
+        f"❌ خطا: <b>{fail}</b>"
+    )
+    for e in errors[:5]:
+        result += f"\n🔴 <code>{e}</code>"
+    if len(errors) > 5:
+        result += f"\n... و {len(errors) - 5} خطای دیگه"
+
+    await state.clear()
+    await msg.answer(result, reply_markup=accounts_menu(), parse_mode="HTML")
+
+
+# ── یوزرنیم اکانت‌ها ─────────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "ep:usernames")
+async def cb_ep_usernames(cb: types.CallbackQuery, state: FSMContext):
+    if not await guard(cb.message): return
+    total = len(db.get_all_accounts())
+    await cb.message.edit_text(
+        "🔑 <b>تغییر یوزرنیم اکانت‌ها</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 تعداد اکانت‌ها: <b>{total}</b>\n\n"
+        f"لطفاً <b>{total}</b> یوزرنیم مختلف رو در یک پیام بفرست.\n"
+        "فرمت (با _ از هم جدا کن):\n"
+        "<code>@ali_test123 _ @mmd_xyz _ @sara_ok _ ...</code>\n\n"
+        "⚠️ یوزرنیم‌ها باید منحصربه‌فرد و بین ۵ تا ۳۲ کاراکتر باشن.\n"
+        "⚠️ هر یوزرنیم برای یک اکانت جداست.",
+        parse_mode="HTML",
+    )
+    await state.set_state(EditProfiles.waiting_usernames)
+    await cb.answer()
+
+
+@router.message(StateFilter(EditProfiles.waiting_usernames))
+async def ep_receive_usernames(msg: types.Message, state: FSMContext):
+    if not await guard(msg): return
+    raw = msg.text.strip() if msg.text else ""
+    if not raw:
+        await msg.answer("❌ پیام خالی بود. دوباره بفرست یا /cancel بزن.")
+        return
+
+    # پاکسازی: حذف @ و فاصله‌های اضافی
+    parts = [u.strip().lstrip("@") for u in raw.split("_") if u.strip().lstrip("@")]
+    accounts = db.get_all_accounts()
+    total = len(accounts)
+
+    if not parts:
+        await msg.answer("❌ هیچ یوزرنیمی یافت نشد. دقت کن با _ جدا باشن.")
+        return
+
+    progress_msg = await msg.answer(
+        f"⏳ در حال تغییر یوزرنیم‌ها...\n0 / {min(len(parts), total)} اکانت",
+    )
+
+    import random
+    ok, fail = 0, 0
+    errors = []
+
+    for idx, (acc, username) in enumerate(zip(accounts, parts), 1):
+        c = None
+        try:
+            from core.engine import make_client
+            from telethon.tl.functions.account import UpdateUsernameRequest
+            c = await make_client(acc)
+            await c.connect()
+            await c(UpdateUsernameRequest(username=username))
+            ok += 1
+        except Exception as e:
+            fail += 1
+            errors.append(f"📱 {acc['phone']} → @{username}: {str(e)[:60]}")
+        finally:
+            if c:
+                try: await c.disconnect()
+                except: pass
+
+        if idx % 5 == 0 or idx == min(len(parts), total):
+            try:
+                await progress_msg.edit_text(
+                    f"⏳ تغییر یوزرنیم‌ها...\n✅ {ok} موفق | ❌ {fail} خطا | {idx}/{min(len(parts), total)}",
+                )
+            except: pass
+        await asyncio.sleep(random.uniform(2, 5))  # برای جلوگیری از flood
+
+    result = (
+        "✅ <b>تغییر یوزرنیم‌ها تموم شد</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"✅ موفق: <b>{ok}</b>\n"
+        f"❌ خطا: <b>{fail}</b>"
+    )
+    for e in errors[:5]:
+        result += f"\n🔴 <code>{e}</code>"
+    if len(errors) > 5:
+        result += f"\n... و {len(errors) - 5} خطای دیگه"
+
+    await state.clear()
+    await msg.answer(result, reply_markup=accounts_menu(), parse_mode="HTML")
+
+
+# ── پروفایل اکانت‌ها (عکس) ───────────────────────────────────────────────────
+
+@router.callback_query(F.data == "ep:photos")
+async def cb_ep_photos(cb: types.CallbackQuery, state: FSMContext):
+    if not await guard(cb.message): return
+    total = len(db.get_all_accounts())
+    await cb.message.edit_text(
+        "🖼 <b>تغییر عکس پروفایل اکانت‌ها</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 تعداد اکانت‌ها: <b>{total}</b>\n\n"
+        f"یه فایل <b>ZIP</b> بفرست که داخلش <b>{total}</b> تا عکس باشه.\n\n"
+        "📌 فرمت نام‌گذاری عکس‌ها:\n"
+        "<code>1.jpg , 2.jpg , 3.jpg , ...</code>\n\n"
+        "⚠️ عکس شماره ۱ برای اکانت اول، شماره ۲ برای اکانت دوم و الی آخر.\n"
+        "⚠️ فرمت‌های مجاز: jpg, jpeg, png",
+        parse_mode="HTML",
+    )
+    await state.set_state(EditProfiles.waiting_photos_zip)
+    await cb.answer()
+
+
+@router.message(StateFilter(EditProfiles.waiting_photos_zip))
+async def ep_receive_photos_zip(msg: types.Message, state: FSMContext):
+    if not await guard(msg): return
+    if not msg.document:
+        await msg.answer("❌ فایل ZIP بفرست، نه متن یا عکس مستقیم.")
+        return
+
+    fname = msg.document.file_name or ""
+    if not fname.lower().endswith(".zip"):
+        await msg.answer("❌ فایل باید ZIP باشه.")
+        return
+
+    progress_msg = await msg.answer("📥 در حال دانلود فایل ZIP...")
+
+    import tempfile, zipfile, os
+    from pathlib import Path as _Path
+
+    # دانلود فایل
+    bot: Bot = msg.bot
+    file_info = await bot.get_file(msg.document.file_id)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        zip_path = os.path.join(tmpdir, "photos.zip")
+        await bot.download_file(file_info.file_path, destination=zip_path)
+
+        # استخراج
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(tmpdir)
+        except zipfile.BadZipFile:
+            await msg.answer("❌ فایل ZIP خراب یا ناقصه.")
+            await state.clear()
+            return
+
+        # پیدا کردن عکس‌ها و مرتب‌سازی عددی
+        allowed_exts = {".jpg", ".jpeg", ".png"}
+        photos = []
+        for root, dirs, files in os.walk(tmpdir):
+            for f in files:
+                if os.path.splitext(f)[1].lower() in allowed_exts and f != "photos.zip":
+                    photos.append(os.path.join(root, f))
+
+        def _sort_key(p):
+            name = os.path.splitext(os.path.basename(p))[0]
+            try: return (0, int(name))
+            except: return (1, name)
+
+        photos.sort(key=_sort_key)
+
+        accounts = db.get_all_accounts()
+        total = len(accounts)
+
+        if not photos:
+            await msg.answer("❌ داخل ZIP هیچ عکسی (jpg/jpeg/png) پیدا نشد.")
+            await state.clear()
+            return
+
+        await progress_msg.edit_text(
+            f"✅ {len(photos)} عکس پیدا شد.\n⏳ شروع آپلود پروفایل‌ها..."
+        )
+
+        import random
+        ok, fail = 0, 0
+        errors = []
+
+        for idx, (acc, photo_path) in enumerate(zip(accounts, photos), 1):
+            c = None
+            try:
+                from core.engine import make_client
+                from telethon.tl.functions.photos import UploadProfilePhotoRequest
+                c = await make_client(acc)
+                await c.connect()
+                uploaded = await c.upload_file(photo_path)
+                await c(UploadProfilePhotoRequest(file=uploaded))
+                ok += 1
+            except Exception as e:
+                fail += 1
+                errors.append(f"📱 {acc['phone']}: {str(e)[:60]}")
+            finally:
+                if c:
+                    try: await c.disconnect()
+                    except: pass
+
+            if idx % 5 == 0 or idx == min(len(photos), total):
+                try:
+                    await progress_msg.edit_text(
+                        f"⏳ آپلود پروفایل‌ها...\n✅ {ok} موفق | ❌ {fail} خطا | {idx}/{min(len(photos), total)}",
+                    )
+                except: pass
+            await asyncio.sleep(random.uniform(2, 5))
+
+    result = (
+        "✅ <b>تغییر عکس پروفایل‌ها تموم شد</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"✅ موفق: <b>{ok}</b>\n"
+        f"❌ خطا: <b>{fail}</b>\n"
+        f"📷 عکس‌های استفاده‌شده: <b>{min(len(photos), total)}</b>"
+    )
+    for e in errors[:5]:
+        result += f"\n🔴 <code>{e}</code>"
+    if len(errors) > 5:
+        result += f"\n... و {len(errors) - 5} خطای دیگه"
+
+    await state.clear()
+    await msg.answer(result, reply_markup=accounts_menu(), parse_mode="HTML")
+
+
+# ── پروفایل گروه‌ها (عکس) ────────────────────────────────────────────────────
+
+@router.callback_query(F.data == "ep:group_photos")
+async def cb_ep_group_photos(cb: types.CallbackQuery, state: FSMContext):
+    if not await guard(cb.message): return
+    # خواندن گروه‌های فعال
+    g1 = db.get_setting("group_id")
+    g2 = db.get_setting("group_id2")
+    groups = [g for g in [g1, g2] if g]
+    count = len(groups)
+
+    if not groups:
+        await cb.answer("❌ هیچ گروهی تنظیم نشده!", show_alert=True)
+        return
+
+    await cb.message.edit_text(
+        "🖼 <b>تغییر عکس پروفایل گروه‌ها</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 تعداد گروه‌های فعال: <b>{count}</b>\n\n"
+        f"یه فایل <b>ZIP</b> بفرست که داخلش <b>{count}</b> تا عکس باشه.\n\n"
+        "📌 فرمت نام‌گذاری عکس‌ها:\n"
+        "<code>1.jpg , 2.jpg , ...</code>\n\n"
+        "⚠️ عکس شماره ۱ برای گروه اول، شماره ۲ برای گروه دوم.\n"
+        "⚠️ از اولین اکانت آنلاین برای آپلود استفاده می‌شه.",
+        parse_mode="HTML",
+    )
+    await state.update_data(group_ids=groups)
+    await state.set_state(EditProfiles.waiting_group_photos_zip)
+    await cb.answer()
+
+
+@router.message(StateFilter(EditProfiles.waiting_group_photos_zip))
+async def ep_receive_group_photos_zip(msg: types.Message, state: FSMContext):
+    if not await guard(msg): return
+    if not msg.document:
+        await msg.answer("❌ فایل ZIP بفرست.")
+        return
+
+    fname = msg.document.file_name or ""
+    if not fname.lower().endswith(".zip"):
+        await msg.answer("❌ فایل باید ZIP باشه.")
+        return
+
+    data = await state.get_data()
+    groups = data.get("group_ids", [])
+
+    progress_msg = await msg.answer("📥 در حال دانلود فایل ZIP...")
+
+    import tempfile, zipfile, os
+
+    bot: Bot = msg.bot
+    file_info = await bot.get_file(msg.document.file_id)
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        zip_path = os.path.join(tmpdir, "group_photos.zip")
+        await bot.download_file(file_info.file_path, destination=zip_path)
+
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(tmpdir)
+        except zipfile.BadZipFile:
+            await msg.answer("❌ فایل ZIP خراب یا ناقصه.")
+            await state.clear()
+            return
+
+        allowed_exts = {".jpg", ".jpeg", ".png"}
+        photos = []
+        for root, dirs, files in os.walk(tmpdir):
+            for f in files:
+                if os.path.splitext(f)[1].lower() in allowed_exts and f != "group_photos.zip":
+                    photos.append(os.path.join(root, f))
+
+        def _sort_key(p):
+            name = os.path.splitext(os.path.basename(p))[0]
+            try: return (0, int(name))
+            except: return (1, name)
+
+        photos.sort(key=_sort_key)
+
+        if not photos:
+            await msg.answer("❌ داخل ZIP هیچ عکسی پیدا نشد.")
+            await state.clear()
+            return
+
+        await progress_msg.edit_text(
+            f"✅ {len(photos)} عکس پیدا شد.\n⏳ شروع تغییر عکس گروه‌ها..."
+        )
+
+        import random
+        # پیدا کردن یک اکانت آنلاین برای آپلود
+        accounts = db.get_all_accounts()
+        online_acc = next(
+            (a for a in accounts if a.get("status") == "online"),
+            accounts[0] if accounts else None,
+        )
+        if not online_acc:
+            await msg.answer("❌ هیچ اکانتی موجود نیست.")
+            await state.clear()
+            return
+
+        ok, fail = 0, 0
+        errors = []
+
+        from core.engine import make_client
+        from telethon.tl.functions.channels import EditPhotoRequest
+        from telethon.tl.types import InputChatUploadedPhoto
+
+        c = None
+        try:
+            c = await make_client(online_acc)
+            await c.connect()
+
+            for idx, (group_ref, photo_path) in enumerate(zip(groups, photos), 1):
+                try:
+                    entity = await c.get_entity(group_ref)
+                    # برای گروه/کانال از EditPhotoRequest استفاده می‌کنیم
+                    input_photo = InputChatUploadedPhoto(file=await c.upload_file(photo_path))
+                    await c(EditPhotoRequest(channel=entity, photo=input_photo))
+                    ok += 1
+                except Exception as e:
+                    fail += 1
+                    errors.append(f"گروه {group_ref}: {str(e)[:60]}")
+
+                try:
+                    await progress_msg.edit_text(
+                        f"⏳ تغییر عکس گروه‌ها...\n✅ {ok} موفق | ❌ {fail} خطا | {idx}/{min(len(photos), len(groups))}",
+                    )
+                except: pass
+                await asyncio.sleep(random.uniform(2, 4))
+
+        except Exception as e:
+            errors.append(f"خطای کلی: {str(e)[:80]}")
+        finally:
+            if c:
+                try: await c.disconnect()
+                except: pass
+
+    result = (
+        "✅ <b>تغییر عکس گروه‌ها تموم شد</b>\n"
+        "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"✅ موفق: <b>{ok}</b>\n"
+        f"❌ خطا: <b>{fail}</b>"
+    )
+    for e in errors[:5]:
+        result += f"\n🔴 <code>{e}</code>"
+    if len(errors) > 5:
+        result += f"\n... و {len(errors) - 5} خطای دیگه"
+
+    await state.clear()
+    await msg.answer(result, reply_markup=accounts_menu(), parse_mode="HTML")
+
+
+# ── /cancel برای خروج از هر state ────────────────────────────────────────────
+
+@router.message(Command("cancel"), StateFilter(EditProfiles))
+async def ep_cancel(msg: types.Message, state: FSMContext):
+    await state.clear()
+    await msg.answer("❌ عملیات لغو شد.", reply_markup=accounts_menu())
+
+
+# ── برگشت به منوی اکانت‌ها از ep ─────────────────────────────────────────────
+
+@router.callback_query(F.data == "menu:accounts")
+async def cb_menu_accounts(cb: types.CallbackQuery):
+    if not await guard(cb.message): return
+    total  = len(db.get_all_accounts())
+    online = db.count_by_status().get("online", 0)
+    await cb.message.edit_text(
+        f"👥 <b>مدیریت اکانت‌ها</b>\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+        f"📊 تعداد: <b>{total}</b>\n"
+        f"🟢 آنلاین: <b>{online}</b>\n\n"
+        f"👇 گزینه مورد نظر:",
+        reply_markup=accounts_menu(),
+        parse_mode="HTML",
+    )
+    await cb.answer()
 
 
 # ═══════════════════════════════════════════════════════════════

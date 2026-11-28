@@ -334,29 +334,23 @@ async def ensure_group_listener():
 
 
 class GroupListener:
-    """هر پیام جدید گروه/کانال رو با همه‌ی اکانت‌های شیفت فعال ویو می‌کنه و/یا می‌خونه."""
+    """هر پیام جدید گروه/کانال رو با همه‌ی اکانت‌های شیفت فعال ویو می‌کنه و/یا می‌خونه.
+    حالا از چند گروه هدف (حداکثر ۲ تا) پشتیبانی می‌کنه — هر گروه poll جداست، ویو مشترکه."""
 
-    MAX_GROUP_MSG_AGE  = 60    # ثانیه — پیام‌های قدیمی‌تر skip می‌شن
+    MAX_GROUP_MSG_AGE  = 60
     MAX_GROUP_QUEUE    = 50
-    POLL_INTERVAL      = 1.5   # ثانیه بین هر poll
-    BAD_PHONE_COOLDOWN = 300   # اکانتی که نتونست گروه رو بخونه تا ۵ دقیقه کنار می‌ره
-    SETTINGS_EVERY     = 10    # هر چند ثانیه تنظیمات از دیتابیس دوباره خونده بشه
-    MAX_CATCHUP        = 600   # پیامی که تا ۱۰ دقیقه پیش اومده و جا مونده، هنوز پردازش میشه
-    POLL_FAIL_LIMIT    = 3     # چند poll ناموفق پشت هم تا خواننده عوض بشه
+    POLL_INTERVAL      = 1.5
+    BAD_PHONE_COOLDOWN = 300
+    SETTINGS_EVERY     = 10
+    MAX_CATCHUP        = 600
+    POLL_FAIL_LIMIT    = 3
 
     def __init__(self, num_workers: int = 4):
         self.num_workers   = num_workers
         self.is_running    = False
-        self.client        = None
-        self.client_phone  = None
-        self.group_entity  = None
-        self.group_title   = None
-        self.last_msg_id   = 0
-        self._gid          = 0
         self.mode          = "both"
         self._settings_ts  = 0.0
         self._bad          = {}
-        self._poll_fail    = 0
         self._warm_task    = None
         self.queue         = asyncio.Queue(maxsize=5000)
         self.workers: list = []
@@ -365,40 +359,88 @@ class GroupListener:
                       "read_fail": "", "last_poll": 0.0, "last_error": "", "last_round": "",
                       "skipped_old": 0, "poll_errors": 0, "last_seen_id": 0, "last_new_ts": 0.0}
 
-    # ───────────────── settings (هر ۱۰ ثانیه، بدون قفل‌کردن حلقه) ─────────────────
+        # ── چند گروه هدف: هر slot state مستقل دارد ──
+        # _slots = {gid: {"client": ..., "phone": ..., "entity": ..., "title": ...,
+        #                 "last_msg_id": 0, "poll_fail": 0}}
+        self._slots: dict = {}
+        self._gids: list  = []        # آخرین لیست گروه‌های active
+
+    # ─── کمکی: slot رو init یا برگردون ───
+    def _slot(self, gid) -> dict:
+        if gid not in self._slots:
+            self._slots[gid] = {
+                "client": None, "phone": None, "entity": None,
+                "title": None, "last_msg_id": 0, "poll_fail": 0,
+            }
+        return self._slots[gid]
+
+    # ── backward-compat: کدهای قدیمی که self._gid می‌خونن ──
+    @property
+    def _gid(self):
+        return self._gids[0] if self._gids else 0
+
+    @property
+    def client(self):
+        return self._slot(self._gid).get("client") if self._gid else None
+
+    @property
+    def client_phone(self):
+        return self._slot(self._gid).get("phone") if self._gid else None
+
+    @property
+    def group_entity(self):
+        return self._slot(self._gid).get("entity") if self._gid else None
+
+    @property
+    def group_title(self):
+        return self._slot(self._gid).get("title") if self._gid else None
+
+    @property
+    def last_msg_id(self):
+        return self._slot(self._gid).get("last_msg_id", 0) if self._gid else 0
+
+    # ───────────────── settings ─────────────────
     async def _refresh_settings(self, force: bool = False):
         now = _time.time()
         if not force and now - self._settings_ts < self.SETTINGS_EVERY:
             return
         self._settings_ts = now
         try:
-            gid  = await asyncio.to_thread(db.get_target_group)
-            mode = await asyncio.to_thread(db.get_setting, "group_action", "both")
-        except Exception as e:                  # خطای لحظه‌ای دیتابیس: مقادیر قبلی بمونن
+            new_gids = await asyncio.to_thread(db.get_target_groups)
+            mode     = await asyncio.to_thread(db.get_setting, "group_action", "both")
+        except Exception as e:
             self.stats["last_error"] = f"settings: {type(e).__name__}: {str(e)[:100]}"
             return
         self.mode = mode if mode in _MODES else "both"
-        if gid and gid != self._gid:
-            if self._gid:
-                db.debug_log("group_listener", "group", "CHANGED", f"{self._gid} -> {gid}")
-            self._gid, self.group_entity, self.client, self.client_phone = gid, None, None, None
-            self.last_msg_id = 0
+
+        # گروه‌هایی که حذف شدن → slot پاک بشه
+        removed = set(self._gids) - set(new_gids)
+        for gid in removed:
+            db.debug_log("group_listener", "group", "REMOVED", str(gid))
+            self._slots.pop(gid, None)
+
+        # گروه‌های جدید اضافه شدن → slot خودکار ساخته می‌شه در _slot()
+        added = set(new_gids) - set(self._gids)
+        for gid in added:
+            db.debug_log("group_listener", "group", "ADDED", str(gid))
+            self._slot(gid)["last_msg_id"] = 0   # baseline reset
+
+        self._gids = new_gids
 
     # ───────────────── entry ─────────────────
     async def start(self):
         await self._refresh_settings(force=True)
-        if not self._gid:
+        if not self._gids:
             db.debug_log("group_listener", "start", "SKIP", "گروه هدف تنظیم نشده")
             return
 
         self.is_running = True
         db.debug_log("group_listener", "start", "OK",
-                     f"group={self._gid} | mode={self.mode} | workers={self.num_workers}")
+                     f"groups={self._gids} | mode={self.mode} | workers={self.num_workers}")
 
         if not POOL._initialized:
             await POOL.init()
 
-        # ── scheduler شیفت — تنها نقطه‌ای که باید start بشه ──
         try:
             from core.smart_scheduler import get_smart_scheduler
             _sched = get_smart_scheduler()
@@ -415,25 +457,23 @@ class GroupListener:
         while self.is_running:
             try:
                 await self._refresh_settings()
-                await self._ensure_client()
-                await self._poll()
+                # هر گروه رو جداگانه poll می‌کنیم — یک کلاینت مشترک برای هر گروه
+                for gid in list(self._gids):
+                    await self._ensure_client_for(gid)
+                    await self._poll_for(gid)
             except Exception as e:
                 self.stats["last_error"] = f"{type(e).__name__}: {str(e)[:150]}"
                 db.debug_log("group_listener", "loop", "ERROR", self.stats["last_error"])
-                if self.client_phone:
-                    self._bad[self.client_phone] = _time.time() + self.BAD_PHONE_COOLDOWN
-                self.client, self.client_phone, self.group_entity = None, None, None
                 await asyncio.sleep(1.5)
                 continue
             await asyncio.sleep(self.POLL_INTERVAL)
 
     # ───────────────── warm entity cache ─────────────────
     async def _warm_loop(self):
-        """entity گروه رو برای شیفت فعال و بعدی از قبل کش می‌کنه تا ویو تأخیر نخوره."""
         sem = asyncio.Semaphore(5)
 
-        async def warm(phone):
-            key = (phone, str(self._gid))
+        async def warm_one(phone, gid):
+            key = (phone, str(gid))
             if key in _GROUP_ENTITY_CACHE:
                 return
             async with sem:
@@ -441,23 +481,23 @@ class GroupListener:
                     c = POOL.clients.get(phone)
                     if c is None or not c.is_connected():
                         return
-                    _GROUP_ENTITY_CACHE[key] = await resolve_group_entity(c, self._gid, timeout=20)
+                    _GROUP_ENTITY_CACHE[key] = await resolve_group_entity(c, gid, timeout=20)
                 except Exception as e:
                     db.debug_log("group_listener", "warm", "WARN",
-                                 f"{phone}: {type(e).__name__}: {str(e)[:80]}")
+                                 f"{phone}/{gid}: {type(e).__name__}: {str(e)[:80]}")
 
         while self.is_running:
             try:
                 nxt = (POOL.active_shift % POOL.num_shifts) + 1
                 phones = list(POOL.shifts.get(POOL.active_shift, [])) + list(POOL.shifts.get(nxt, []))
-                await asyncio.gather(*(warm(p) for p in phones), return_exceptions=True)
+                warm_tasks = [warm_one(p, gid) for p in phones for gid in self._gids]
+                await asyncio.gather(*warm_tasks, return_exceptions=True)
             except Exception as e:
                 db.debug_log("group_listener", "warm", "ERROR", f"{type(e).__name__}: {e}")
             await asyncio.sleep(20)
 
-    # ───────────────── ensure client ─────────────────
+    # ───────────────── ensure client per group ─────────────────
     async def _pick_client(self):
-        """اولین اکانت سالمی که قبلاً نشکسته؛ اول اونایی که همین الان وصلن."""
         now = _time.time()
         cands = [p for p in POOL.all_phones
                  if p not in POOL.blacklist and self._bad.get(p, 0) < now]
@@ -468,57 +508,61 @@ class GroupListener:
                 return phone, c
         return None, None
 
-    async def _ensure_client(self):
-        if (self.client is not None and self.client.is_connected()
-                and self.group_entity is not None):
+    async def _ensure_client_for(self, gid):
+        sl = self._slot(gid)
+        if (sl["client"] is not None and sl["client"].is_connected()
+                and sl["entity"] is not None):
             return
         last_exc = None
-        for _ in range(8):                    # چند اکانت پشت سر هم، بدون sleep بینشون
+        for _ in range(8):
             phone, c = await self._pick_client()
             if c is None:
                 break
             try:
-                ent = await resolve_group_entity(c, self._gid)
+                ent  = await resolve_group_entity(c, gid)
                 msgs = await asyncio.wait_for(c.get_messages(ent, limit=1), timeout=15)
             except Exception as e:
                 self._bad[phone] = _time.time() + self.BAD_PHONE_COOLDOWN
                 last_exc = e
                 db.debug_log("group_listener", "pick", "WARN",
-                             f"{phone}: {type(e).__name__}: {str(e)[:100]}")
+                             f"{phone}/{gid}: {type(e).__name__}: {str(e)[:100]}")
                 continue
-            self.client, self.client_phone, self.group_entity = c, phone, ent
-            self.group_title = getattr(ent, "title", None) or getattr(ent, "username", None)
-            if msgs and self.last_msg_id == 0:      # با عوض‌شدن خواننده، baseline پرش نکنه
-                self.last_msg_id = msgs[0].id
+            sl["client"] = c
+            sl["phone"]  = phone
+            sl["entity"] = ent
+            sl["title"]  = getattr(ent, "title", None) or getattr(ent, "username", None)
+            if msgs and sl["last_msg_id"] == 0:
+                sl["last_msg_id"] = msgs[0].id
             self.stats["last_error"] = ""
             db.debug_log("group_listener", "init", "OK",
-                         f"group: {self.group_title} | via {phone} | last: {self.last_msg_id}")
+                         f"group: {sl['title']} ({gid}) | via {phone} | last: {sl['last_msg_id']}")
             return
-        raise last_exc or RuntimeError("هیچ اکانت سالمی برای لیسنر نیست")
+        raise last_exc or RuntimeError(f"هیچ اکانت سالمی برای لیسنر {gid} نیست")
 
-    # ───────────────── poll ─────────────────
-    async def _poll(self):
-        if self.client is None or self.group_entity is None:
+    # ───────────────── poll per group ─────────────────
+    async def _poll_for(self, gid):
+        sl = self._slot(gid)
+        if sl["client"] is None or sl["entity"] is None:
             return
 
         try:
-            # min_id: فقط پیام‌های بعد از baseline میاد؛ سبک‌تر و بدون خطر گم‌شدن پیام
             msgs = await asyncio.wait_for(
-                self.client.get_messages(self.group_entity, limit=100, min_id=self.last_msg_id),
+                sl["client"].get_messages(sl["entity"], limit=100, min_id=sl["last_msg_id"]),
                 timeout=15)
         except FloodWaitError as e:
-            self.stats["last_error"] = f"FloodWait {e.seconds}s روی خواننده"
+            self.stats["last_error"] = f"FloodWait {e.seconds}s روی خواننده {gid}"
             await asyncio.sleep(min(e.seconds, 30))
             return
         except (asyncio.TimeoutError, ConnectionError, OSError) as e:
-            self._poll_fail += 1
+            sl["poll_fail"] = sl.get("poll_fail", 0) + 1
             self.stats["poll_errors"] += 1
-            self.stats["last_error"] = f"poll {type(e).__name__} ({self._poll_fail}/{self.POLL_FAIL_LIMIT})"
-            if self._poll_fail >= self.POLL_FAIL_LIMIT:
-                self._poll_fail = 0
-                raise                              # بعد از چند شکست پشت هم، خواننده عوض بشه
+            self.stats["last_error"] = (
+                f"poll {gid} {type(e).__name__} ({sl['poll_fail']}/{self.POLL_FAIL_LIMIT})")
+            if sl["poll_fail"] >= self.POLL_FAIL_LIMIT:
+                sl["poll_fail"] = 0
+                sl["client"] = sl["entity"] = sl["phone"] = None   # خواننده عوض بشه
             return
-        self._poll_fail = 0
+        sl["poll_fail"] = 0
         self.stats["polls"] += 1
         self.stats["last_poll"] = _time.time()
         if not msgs:
@@ -536,13 +580,13 @@ class GroupListener:
                     break
             db.debug_log("group_listener", "purge", "WARN", f"queue:{qsize} → purged:{purged}")
 
-        new_msgs = [m for m in msgs if m.id > self.last_msg_id]
+        new_msgs = [m for m in msgs if m.id > sl["last_msg_id"]]
         if not new_msgs:
             return
         new_msgs.sort(key=lambda m: m.id)
-        self.last_msg_id = new_msgs[-1].id
+        sl["last_msg_id"] = new_msgs[-1].id
         self.stats["new_msgs"] += len(new_msgs)
-        self.stats["last_seen_id"] = self.last_msg_id
+        self.stats["last_seen_id"] = sl["last_msg_id"]
         self.stats["last_new_ts"] = _time.time()
 
         if _VIEW_PAUSED:
@@ -552,18 +596,18 @@ class GroupListener:
         queued = 0
         for m in new_msgs:
             mts = m.date.timestamp() if m.date else now
-            if now - mts > self.MAX_CATCHUP:          # خیلی قدیمی (مثلاً بعد از وقفه‌ی طولانی)
+            if now - mts > self.MAX_CATCHUP:
                 self.stats["skipped_old"] += 1
                 continue
             try:
-                # سن رو از لحظه‌ی کشف حساب می‌کنیم، نه از ساعت پیام (ساعت‌ها ممکنه اختلاف داشته باشن)
-                self.queue.put_nowait((m.id, now))
+                # آیتم صف: (gid, msg_id, timestamp_discovery)
+                self.queue.put_nowait((gid, m.id, now))
                 queued += 1
             except asyncio.QueueFull:
                 pass
 
         db.debug_log("group_listener", "queue_add", "OK",
-                     f"+{queued}/{len(new_msgs)} | queue: {self.queue.qsize()}")
+                     f"{gid} +{queued}/{len(new_msgs)} | queue: {self.queue.qsize()}")
 
     # ───────────────── worker ─────────────────
     async def _worker(self, wid: int):
@@ -575,16 +619,22 @@ class GroupListener:
             except Exception:
                 break
 
-            msg_id, ts = item
+            # آیتم ممکنه فرمت قدیمی (msg_id, ts) یا جدید (gid, msg_id, ts) باشه
+            if len(item) == 3:
+                gid, msg_id, ts = item
+            else:
+                gid, (msg_id, ts) = self._gid, item
+
             age = _time.time() - ts
             if age > self.MAX_GROUP_MSG_AGE:
-                db.debug_log("group_listener", f"w{wid}", "SKIP", f"ID={msg_id} age={age:.0f}s")
+                db.debug_log("group_listener", f"w{wid}", "SKIP",
+                             f"gid={gid} ID={msg_id} age={age:.0f}s")
                 self.queue.task_done()
                 continue
 
             phones = list(POOL.active_phones())
             try:
-                await self._read_message(msg_id, phones, wid)
+                await self._read_message(gid, msg_id, phones, wid)
             except Exception as e:
                 db.debug_log("group_listener", f"w{wid}", "ERROR", str(e))
             finally:
@@ -593,14 +643,14 @@ class GroupListener:
                 except Exception:
                     pass
 
-    # ───────────────── یک اکانت، یک پیام ─────────────────
+    # ───────────────── یک اکانت، یک پیام، یک گروه ─────────────────
     def _flood(self, phone, r):
         u = (datetime.utcnow() + timedelta(seconds=r["flood"])).isoformat()
         db.update_account_status(phone, "flood", r["error"], u)
         return (f"FLOOD:{r['flood']}", phone)
 
-    async def _read_one(self, phone: str, msg_id: int):
-        lock = _GROUP_PHONE_LOCKS.setdefault(phone, asyncio.Lock())
+    async def _read_one(self, phone: str, gid, msg_id: int):
+        lock = _GROUP_PHONE_LOCKS.setdefault((phone, str(gid)), asyncio.Lock())
         async with lock:
             try:
                 c = POOL.clients.get(phone)
@@ -609,11 +659,11 @@ class GroupListener:
                     if c is None:
                         return ("NO_CLI", phone)
 
-                key = (phone, str(self._gid))
+                key = (phone, str(gid))
                 ent = _GROUP_ENTITY_CACHE.get(key)
                 if ent is None:
                     try:
-                        ent = await resolve_group_entity(c, self._gid, timeout=8)
+                        ent = await resolve_group_entity(c, gid, timeout=8)
                         _GROUP_ENTITY_CACHE[key] = ent
                     except Exception as e:
                         return (f"ENT:{type(e).__name__}", phone)
@@ -651,9 +701,9 @@ class GroupListener:
                 return (f"OUT:{type(e).__name__}", phone)
 
     # ───────────────── یک پیام، همه‌ی اکانت‌ها ─────────────────
-    async def _read_message(self, msg_id: int, phones: list, wid: int):
+    async def _read_message(self, gid, msg_id: int, phones: list, wid: int):
         if not phones:
-            self.stats["last_round"] = f"ID={msg_id} | شیفت فعال اکانتی نداره"
+            self.stats["last_round"] = f"gid={gid} ID={msg_id} | شیفت فعال اکانتی نداره"
             return 0, 0, Counter()
         random.shuffle(phones)
         n      = len(phones)
@@ -663,7 +713,7 @@ class GroupListener:
         async def one(phone, delay):
             if delay > 0:
                 await asyncio.sleep(delay)
-            return await self._read_one(phone, msg_id)
+            return await self._read_one(phone, gid, msg_id)
 
         tasks = [
             spawn(one(phone, (i / max(n, 1)) * window + random.uniform(0, 0.15)))
@@ -690,9 +740,9 @@ class GroupListener:
         elapsed = _time.time() - t0
         summary = " | ".join(f"{k}={v}" for k, v in reasons.most_common(5))
         self.stats["rounds"] += 1
-        self.stats["last_round"] = f"ID={msg_id} | {suc}/{n} | {elapsed:.1f}s | {summary}"
+        self.stats["last_round"] = f"gid={gid} ID={msg_id} | {suc}/{n} | {elapsed:.1f}s | {summary}"
         db.debug_log("group_listener", "read_done", "RESULT",
-                     f"ID={msg_id} | w{wid} | {suc}/{n} | {elapsed:.1f}s | {summary} | q:{self.queue.qsize()}")
+                     f"gid={gid} ID={msg_id} | w{wid} | {suc}/{n} | {elapsed:.1f}s | {summary} | q:{self.queue.qsize()}")
         return suc, n, reasons
 
     # ───────────────── تشخیص و تست ─────────────────
@@ -700,29 +750,42 @@ class GroupListener:
         s = self.stats
         age = f"{_time.time() - s['last_poll']:.0f}s پیش" if s["last_poll"] else "هنوز نشده"
         phones = list(POOL.active_phones())
-        live = sum(1 for p in phones if POOL._is_live(p))
-        warmed = sum(1 for p in phones if (p, str(self._gid)) in _GROUP_ENTITY_CACHE)
+        live   = sum(1 for p in phones if POOL._is_live(p))
         running = "✅ روشن" if self.is_running else "🔴 خاموش"
         if s["last_new_ts"]:
             last_new = f"{_time.time() - s['last_new_ts']:.0f}s پیش"
         else:
             last_new = "هنوز پیام جدیدی نیومده"
+
+        # خط‌های هر گروه
+        group_lines = ""
+        for gid in self._gids:
+            sl = self._slots.get(gid, {})
+            title  = sl.get("title") or "هنوز resolve نشده"
+            reader = sl.get("phone") or "—"
+            warmed = sum(1 for p in phones if (p, str(gid)) in _GROUP_ENTITY_CACHE)
+            baseline = sl.get("last_msg_id", 0)
+            group_lines += (
+                f"  🎯 <code>{db.fmt_group(gid)}</code> → <b>{title}</b>"
+                f" | خواننده: <code>{reader}</code>"
+                f" | entity آماده: {warmed} | baseline: {baseline}\n"
+            )
+
         t = (
             f"🩺 <b>تشخیص ویو</b>\n━━━━━━━━━━━━━━━━━━━━━━\n"
             f"لیسنر: {running}{'  ⏸ <b>PAUSE</b>' if _VIEW_PAUSED else ''}\n"
-            f"🎯 گروه: <code>{db.fmt_group(self._gid)}</code> → <b>{self.group_title or 'هنوز resolve نشده'}</b>\n"
             f"⚙️ عملیات: {_MODE_FA.get(self.mode, self.mode)}\n"
-            f"👁 اکانت خواننده: <code>{self.client_phone or '—'}</code>"
-            f"{' | کنارگذاشته: ' + str(sum(1 for v in self._bad.values() if v > _time.time())) if self._bad else ''}\n"
+            f"{group_lines}"
+            f"{'کنارگذاشته: ' + str(sum(1 for v in self._bad.values() if v > _time.time())) + ' اکانت' if self._bad else ''}\n"
             f"🔄 poll: {s['polls']} | آخرین: {age}\n"
             f"✉️ پیام جدید دیده‌شده: <b>{s['new_msgs']}</b> | صف: {self.queue.qsize()}"
             f"{' | قدیمیِ ردشده: ' + str(s['skipped_old']) if s['skipped_old'] else ''}\n"
-            f"📍 baseline: {self.last_msg_id} | آخرین جدید: {last_new} | خطای poll: {s['poll_errors']}\n"
+            f"آخرین جدید: {last_new} | خطای poll: {s['poll_errors']}\n"
             f"🎬 راند: {s['rounds']} | ویو موفق: <b>{s['views_ok']}</b> | خواندن موفق: {s['reads_ok']}\n"
-            f"👥 شیفت {POOL.active_shift}: {len(phones)} اکانت | وصل: {live} | entity آماده: {warmed}\n"
+            f"👥 شیفت {POOL.active_shift}: {len(phones)} اکانت | وصل: {live}\n"
         )
         if s["last_round"]:
-            t += f"📋 آخرین راند: <code>{s['last_round'][:160]}</code>\n"
+            t += f"📋 آخرین راند: <code>{s['last_round'][:180]}</code>\n"
         if self.fail_reasons:
             top = ", ".join(f"{k}×{v}" for k, v in self.fail_reasons.most_common(4))
             t += f"🔴 دلایل شکست: <code>{top[:160]}</code>\n"
@@ -733,15 +796,19 @@ class GroupListener:
         return t
 
     async def test_round(self) -> str:
-        """روی آخرین پیام گروه یه راند کامل اجرا می‌کنه، بدون منتظر پیام جدید موندن."""
+        """روی آخرین پیام گروه اول یه راند کامل اجرا می‌کنه."""
         await self._refresh_settings(force=True)
-        await self._ensure_client()
-        msgs = await asyncio.wait_for(self.client.get_messages(self.group_entity, limit=1), timeout=15)
+        if not self._gids:
+            return "❌ هیچ گروهی تنظیم نشده."
+        gid = self._gids[0]
+        await self._ensure_client_for(gid)
+        sl = self._slot(gid)
+        msgs = await asyncio.wait_for(sl["client"].get_messages(sl["entity"], limit=1), timeout=15)
         if not msgs:
             return "❌ گروه هیچ پیامی نداره."
         phones = list(POOL.active_phones())
-        suc, n, reasons = await self._read_message(msgs[0].id, phones, -1)
-        text = f"🧪 <b>تست روی پیام {msgs[0].id}</b>\n✅ موفق: <b>{suc}/{n}</b> ({_MODE_FA[self.mode]})"
+        suc, n, reasons = await self._read_message(gid, msgs[0].id, phones, -1)
+        text = f"🧪 <b>تست روی پیام {msgs[0].id} (گروه {db.fmt_group(gid)})</b>\n✅ موفق: <b>{suc}/{n}</b> ({_MODE_FA[self.mode]})"
         for k, v in reasons.most_common(6):
             if k != "OK":
                 text += f"\n🔴 {v}× <code>{k}</code>"

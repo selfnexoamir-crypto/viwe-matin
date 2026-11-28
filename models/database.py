@@ -40,6 +40,7 @@ def init_db():
     sb = _get_client()
     defaults = {
         "target_group_id":   str(Config.TARGET_GROUP_ID),
+        "target_group_id_2": "",                          # گروه دوم — پیش‌فرض خالی
         "shift_min_sec":     str(Config.SHIFT_MIN_SEC),
         "shift_max_sec":     str(Config.SHIFT_MAX_SEC),
         "active_shift":      "1",
@@ -160,6 +161,37 @@ def get_target_group():
 
 
 get_target_group_id = get_target_group      # سازگاری با کدهای قبلی
+
+
+def get_target_groups() -> list:
+    """لیست همه گروه‌های هدف فعال (حداکثر ۲ تا).
+    خروجی: [ref1] یا [ref1, ref2] یا [] — هیچ‌وقت None نیست."""
+    refs = []
+    primary = get_target_group()
+    if primary:
+        refs.append(primary)
+    v2 = get_setting("target_group_id_2", "")
+    if v2 and v2 not in ("", "0"):
+        ref2 = parse_group_ref(v2)
+        if ref2 and ref2 != primary:
+            refs.append(ref2)
+    return refs
+
+
+def get_target_group2():
+    """گروه هدف دوم — str/int یا None."""
+    v = get_setting("target_group_id_2", "")
+    if not v or v in ("", "0"):
+        return None
+    return parse_group_ref(v)
+
+
+def set_target_group2(ref):
+    """ست یا پاک‌کردن گروه دوم. ref=None یا ref=0 → پاک می‌کنه."""
+    if ref is None or ref == 0:
+        set_setting("target_group_id_2", "")
+    else:
+        set_setting("target_group_id_2", str(ref))
 
 
 def _fetch_all(table: str, columns: str = "*", order: str | None = None, page: int = 1000) -> list[dict]:
